@@ -116,6 +116,30 @@ class SigV4ValidatorTest {
         assertFalse(validator.validate(token, "cache-cluster-01", "default"));
     }
 
+    /**
+     * A bare 12-digit access key ID that isn't registered in IAM must be rejected like any
+     * other unknown key, not resolved to the well-known "test" secret. That fallback would let
+     * a client forge an IAM-auth token for any account number, signed with the public "test"
+     * secret, and authenticate as any matching cache user — a bypass of ElastiCache IAM
+     * authentication, which is only consulted when a caller has explicitly opted into it.
+     */
+    @Test
+    void validateRejectsUnregisteredNumericAccessKeyId() throws Exception {
+        IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDCACHE", "secret-cache");
+
+        SigV4Validator validator = new SigV4Validator(iamService);
+        String token = SigV4TokenTestHelper.createElastiCacheToken(
+                "cache-cluster-01",
+                "default",
+                "123456789012",
+                "test",
+                Instant.now().minusSeconds(60),
+                900
+        );
+
+        assertFalse(validator.validate(token, "cache-cluster-01", "default"));
+    }
+
     @Test
     void validateRejectsTokenForWrongUser() throws Exception {
         IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDCACHE", "secret-cache");

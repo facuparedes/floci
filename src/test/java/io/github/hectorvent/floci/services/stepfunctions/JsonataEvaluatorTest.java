@@ -614,4 +614,73 @@ class JsonataEvaluatorTest {
         assertEquals(40000200000L,
                 evaluator.evaluate("{% $sum($map([1..200000], function($v){$v * 2})) %}", statesVar).asLong());
     }
+
+    @Test
+    void string_writesAWholeNumberInFullBelowTheExponentBoundary() {
+        // dashjoin stops writing digits at Long.MAX_VALUE, 9.223372036854776E18, and prints
+        // exponent notation from there. AWS keeps writing them until 1e21.
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("10000000000000000000", evaluator.evaluate("{% $string(1e19) %}", statesVar).asText());
+        assertEquals("100000000000000000000", evaluator.evaluate("{% $string(1e20) %}", statesVar).asText());
+        assertEquals("150000000000000000000", evaluator.evaluate("{% $string(1.5e20) %}", statesVar).asText());
+        // The largest double under the boundary.
+        assertEquals("999999999999999900000",
+                evaluator.evaluate("{% $string(999999999999999868928) %}", statesVar).asText());
+    }
+
+    @Test
+    void string_switchesToExponentNotationAt1e21() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("1e+21", evaluator.evaluate("{% $string(1e21) %}", statesVar).asText());
+        // 1e21 - 1 is not a double, so it is the same number as 1e21 and prints the same way.
+        assertEquals("1e+21", evaluator.evaluate("{% $string(1e21 - 1) %}", statesVar).asText());
+        assertEquals("1e+22", evaluator.evaluate("{% $string(1e22) %}", statesVar).asText());
+        assertEquals("1e+100", evaluator.evaluate("{% $string(1e100) %}", statesVar).asText());
+    }
+
+    @Test
+    void string_flipsAtTheSameBoundaryOnANegativeNumber() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("-100000000000000000000", evaluator.evaluate("{% $string(-1e20) %}", statesVar).asText());
+        assertEquals("-150000000000000000000", evaluator.evaluate("{% $string(-1.5e20) %}", statesVar).asText());
+        assertEquals("-1e+21", evaluator.evaluate("{% $string(-1e21) %}", statesVar).asText());
+    }
+
+    @Test
+    void string_writesTheShortestDigitsThatReadBackAsTheSameDouble() {
+        // The two sides of $parse's number model print differently across the long boundary: the
+        // long prints its exact value, the double prints the shortest decimal that reads back as
+        // itself, so 2^63 is 9223372036854776000 and not its exact 9223372036854775808.
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("9223372036854775807",
+                evaluator.evaluate("{% $string($parse('{\"n\":9223372036854775807}').n) %}", statesVar).asText());
+        assertEquals("9223372036854776000",
+                evaluator.evaluate("{% $string($parse('{\"n\":9223372036854775808}').n) %}", statesVar).asText());
+    }
+
+    @Test
+    void string_writesANumberInsideAnObjectOrAnArrayTheSameWay() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("{\"n\":100000000000000000000}",
+                evaluator.evaluate("{% $string({'n': 1e20}) %}", statesVar).asText());
+        assertEquals("[100000000000000000000,2]",
+                evaluator.evaluate("{% $string([1e20, 2]) %}", statesVar).asText());
+    }
+
+    @Test
+    void string_leavesEveryOtherValueToTheBuiltIn() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        // AWS switches to exponent notation on the small side too, under 1e-6, and keeps fifteen
+        // significant digits on a fractional number. Both already match.
+        assertEquals("0.000001", evaluator.evaluate("{% $string(1e-6) %}", statesVar).asText());
+        assertEquals("1e-7", evaluator.evaluate("{% $string(1e-7) %}", statesVar).asText());
+        assertEquals("0.333333333333333", evaluator.evaluate("{% $string(1/3) %}", statesVar).asText());
+        assertEquals("true", evaluator.evaluate("{% $string(true) %}", statesVar).asText());
+        assertEquals("abc", evaluator.evaluate("{% $string('abc') %}", statesVar).asText());
+        assertEquals("null", evaluator.evaluate("{% $string(null) %}", statesVar).asText());
+        assertEquals("{\n  \"a\": 1\n}", evaluator.evaluate("{% $string({'a': 1}, true) %}", statesVar).asText());
+        assertTrue(evaluator.evaluate("{% $string() %}", statesVar).isNull());
+        assertEquals("[\"100000000000000000000\",\"1e+21\"]",
+                evaluator.evaluate("{% $map([1e20, 1e21], $string) %}", statesVar).toString());
+    }
 }

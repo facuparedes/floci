@@ -90,6 +90,10 @@ Three behaviours are worth knowing before reading an unexpected result, and all 
   object, so the field goes missing instead of the state failing.
 - `$range` collapses a single-element range to the bare number, not a one-element array.
 
+JSONata's own `$string` follows AWS's number notation: a whole number is written out in full below
+`1e21` and in exponent notation from there, on both signs, so `$string(1e20)` is
+`100000000000000000000` and `$string(1e21)` is `1e+21`.
+
 Evaluation is bounded, as it is on AWS: one expression may run for five seconds and nest 500
 levels deep, and past either the state fails with `States.QueryEvaluationError`. Both bounds sit
 well above what AWS itself accepts, so an expression that evaluates there evaluates here. AWS

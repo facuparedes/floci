@@ -126,6 +126,31 @@ class RdsSigV4ValidatorTest {
         assertFalse(validator.validate(token, "admin"));
     }
 
+    /**
+     * A bare 12-digit access key ID that isn't registered in IAM must be rejected like any
+     * other unknown key, not resolved to the well-known "test" secret. That fallback would let
+     * a client forge an IAM-auth token for any account number, signed with the public "test"
+     * secret, and authenticate as any matching database user — a bypass of RDS IAM
+     * authentication, which is only consulted when a caller has explicitly opted into it.
+     */
+    @Test
+    void validateRejectsUnregisteredNumericAccessKeyId() throws Exception {
+        IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDRDS", "secret-rds");
+
+        RdsSigV4Validator validator = new RdsSigV4Validator(iamService);
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local",
+                5432,
+                "admin",
+                "123456789012",
+                "test",
+                Instant.now().minusSeconds(60),
+                900
+        );
+
+        assertFalse(validator.validate(token, "admin"));
+    }
+
     @Test
     void validateRejectsTokenMissingDbUser() throws Exception {
         IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDRDS", "secret-rds");

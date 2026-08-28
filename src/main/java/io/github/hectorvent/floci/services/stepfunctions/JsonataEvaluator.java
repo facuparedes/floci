@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.stepfunctions;
 
+import com.dashjoin.jsonata.Functions;
 import com.dashjoin.jsonata.JException;
 import com.dashjoin.jsonata.Jsonata;
 import com.fasterxml.jackson.core.JsonParser;
@@ -14,6 +15,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -52,6 +54,13 @@ public class JsonataEvaluator {
      * Past it AWS switches from an integer to exponent notation, and so does {@link #toJsonataValue}.
      */
     private static final double LARGEST_EXACT_LONG_AS_DOUBLE = 9.223372036854776E18;
+
+    /**
+     * The magnitude at which AWS stops writing a whole number in full and switches to exponent
+     * notation, on both signs: {@code $string(1e20)} is {@code "100000000000000000000"} and
+     * {@code $string(1e21)} is {@code "1e+21"}.
+     */
+    private static final double SMALLEST_EXPONENT_NOTATION = 1e21;
 
     /**
      * How long one expression may evaluate before the state fails with
@@ -238,17 +247,22 @@ public class JsonataEvaluator {
     }
 
     /**
-     * The six JSONata functions the Step Functions dialect adds on top of the JSONata language,
-     * per https://docs.aws.amazon.com/step-functions/latest/dg/transforming-data.html. Five of
-     * them the dashjoin library does not have at all; $random it has with the wrong arity, so the
-     * binding shadows it to accept AWS's optional seed.
+     * The JSONata functions Floci binds on the evaluation frame. Six of them are what the Step
+     * Functions dialect adds on top of the JSONata language, per
+     * https://docs.aws.amazon.com/step-functions/latest/dg/transforming-data.html: five the
+     * dashjoin library does not have at all, and $random it has with the wrong arity, so the
+     * binding shadows it to accept AWS's optional seed. The seventh, $string, is a JSONata
+     * function the library has but writes with a different number notation than AWS.
      *
-     * <p>Each signature declares one optional slot more than the arity AWS documents. The library
+     * <p>Each of the six declares one optional slot more than the arity AWS documents. The library
      * pads a short call with Java nulls up to the declared arity and refuses a call longer than
      * it, so the extra slot is what lets an over-long call reach this code and fail with AWS's own
-     * message instead of the library's. A signature is also what makes the function usable as a
-     * value: dashjoin dereferences it unconditionally in $map, $filter, $sift, $each, $single and
-     * $reduce, and a null one throws a raw NullPointerException there.
+     * message instead of the library's. $string keeps the library's own signature instead, so
+     * every arity and type error it already raised stays word for word what it was.
+     *
+     * <p>A signature is also what makes a function usable as a value: dashjoin dereferences it
+     * unconditionally in $map, $filter, $sift, $each, $single and $reduce, and a null one throws a
+     * raw NullPointerException there.
      */
     private Map<String, Jsonata.JFunction> buildStepFunctionsExtensions() {
         return Map.of(
@@ -257,7 +271,8 @@ public class JsonataEvaluator {
                 "range", new Jsonata.JFunction((input, arguments) -> range(arguments), "<x?x?x?x?:x>"),
                 "hash", new Jsonata.JFunction((input, arguments) -> hash(arguments), "<x?x?x?:x>"),
                 "random", new Jsonata.JFunction((input, arguments) -> random(arguments), "<x?x?:x>"),
-                "uuid", new Jsonata.JFunction((input, arguments) -> uuid(arguments), "<x?:x>"));
+                "uuid", new Jsonata.JFunction((input, arguments) -> uuid(arguments), "<x?:x>"),
+                "string", new Jsonata.JFunction((input, arguments) -> string(arguments), "<x-b?:s>"));
     }
 
     /**
@@ -369,6 +384,45 @@ public class JsonataEvaluator {
         }
         if (value == Math.rint(value) && Math.abs(value) < LARGEST_EXACT_LONG_AS_DOUBLE) {
             return (long) value;
+        }
+        return value;
+    }
+
+    /**
+     * $string(value, prettify): the JSONata function, with AWS's number notation. dashjoin writes
+     * a whole number in full only while it fits in a long and prints exponent notation from there,
+     * so $string(1e20) is "1e+20" where AWS writes the twenty-one digits. AWS's boundary is 1e21.
+     *
+     * <p>Nothing else about the function changes: the call reaches the library with the numbers
+     * AWS writes in full already replaced by their digits, so the delimiters, the escaping, the
+     * prettify layout and every error message stay the library's.
+     */
+    private static Object string(List<Object> arguments) {
+        return Functions.string(withWholeNumbersWrittenInFull(argument(arguments, 0)),
+                (Boolean) argument(arguments, 1));
+    }
+
+    /**
+     * Replaces every double AWS writes in full with the exact integer of the shortest decimal that
+     * reads back as that double, which is the digit string AWS prints: a double holding 2^63 is
+     * "9223372036854776000" there and not its exact value 9223372036854775808. A BigInteger is
+     * printed verbatim, so the notation stops being the library's decision.
+     */
+    private static Object withWholeNumbersWrittenInFull(Object value) {
+        if (value instanceof Double number) {
+            boolean writtenInFull = Double.isFinite(number) && number % 1 == 0
+                    && Math.abs(number) < SMALLEST_EXPONENT_NOTATION;
+            return writtenInFull ? BigDecimal.valueOf(number).toBigInteger() : number;
+        }
+        if (value instanceof Map<?, ?> object) {
+            Map<String, Object> written = new LinkedHashMap<>();
+            object.forEach((key, field) -> written.put(String.valueOf(key), withWholeNumbersWrittenInFull(field)));
+            return written;
+        }
+        if (value instanceof List<?> array) {
+            List<Object> written = new ArrayList<>();
+            array.forEach(element -> written.add(withWholeNumbersWrittenInFull(element)));
+            return written;
         }
         return value;
     }
