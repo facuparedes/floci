@@ -23,6 +23,7 @@
 | `ListExecutions` | List executions for a state machine |
 | `StopExecution` | Stop a running execution |
 | `GetExecutionHistory` | Get the full event history of an execution |
+| `DescribeMapRun` | Get the item and execution counters of a distributed Map run |
 | `SendTaskSuccess` | Report task success (for `.waitForTaskToken` tasks) |
 | `SendTaskFailure` | Report task failure |
 | `SendTaskHeartbeat` | Send a heartbeat for long-running tasks |

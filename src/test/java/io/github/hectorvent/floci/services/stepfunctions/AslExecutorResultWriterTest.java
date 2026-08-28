@@ -54,6 +54,9 @@ class AslExecutorResultWriterTest {
         s3Service = mock(S3Service.class);
         when(s3Service.putObject(anyString(), anyString(), any(byte[].class), anyString(), any()))
                 .thenReturn(null);
+        // An exported Map run is retained through the service, so a Map state needs one to run.
+        Instance<StepFunctionsService> sfnService = mock(Instance.class);
+        when(sfnService.get()).thenReturn(mock(StepFunctionsService.class));
         executor = new AslExecutor(
                 mock(LambdaExecutorService.class),
                 mock(LambdaFunctionStore.class),
@@ -70,7 +73,7 @@ class AslExecutorResultWriterTest {
                 mock(io.github.hectorvent.floci.services.scheduler.SchedulerController.class),
                 mapper,
                 new JsonataEvaluator(mapper),
-                mock(Instance.class),
+                sfnService,
                 mock(EmulatorConfig.class),
                 null);
 

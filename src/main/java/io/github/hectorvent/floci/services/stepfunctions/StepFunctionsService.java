@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.services.stepfunctions.model.Activity;
 import io.github.hectorvent.floci.services.stepfunctions.model.ActivityTask;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
+import io.github.hectorvent.floci.services.stepfunctions.model.MapRun;
 import io.github.hectorvent.floci.services.stepfunctions.model.MockedTestCase;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachineVersion;
@@ -44,6 +45,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     private final StorageBackend<String, StateMachine> stateMachineStore;
     private final StorageBackend<String, Execution> executionStore;
     private final StorageBackend<String, Activity> activityStore;
+    private final StorageBackend<String, MapRun> mapRunStore;
     private final Map<String, List<HistoryEvent>> historyCache = new ConcurrentHashMap<>();
     private final Map<String, BlockingQueue<ActivityTask>> activityQueues = new ConcurrentHashMap<>();
     private final Map<String, CompletableFuture<JsonNode>> pendingTaskTokens = new ConcurrentHashMap<>();
@@ -76,6 +78,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
                 new TypeReference<Map<String, Execution>>() {});
         this.activityStore = storageFactory.create("stepfunctions", "sfn-activities.json",
                 new TypeReference<Map<String, Activity>>() {});
+        this.mapRunStore = storageFactory.create("stepfunctions", "sfn-map-runs.json",
+                new TypeReference<Map<String, MapRun>>() {});
         this.regionResolver = regionResolver;
         this.aslExecutor = aslExecutor;
         this.objectMapper = objectMapper;
@@ -762,6 +766,23 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
 
     public void sendTaskHeartbeat(String taskToken) {
         LOG.debugv("Task heartbeat for token {0}", taskToken);
+    }
+
+    // ──────────────────────────── Map runs ────────────────────────────
+
+    /**
+     * Retains a finished Map run so {@code DescribeMapRun} can still report it once the execution
+     * that opened it is over. Reconciliation state machines read those counters from a later state,
+     * or from a later execution altogether, so the run has to outlive the Map that produced it.
+     */
+    public void recordMapRun(MapRun mapRun) {
+        mapRunStore.put(mapRun.getMapRunArn(), mapRun);
+    }
+
+    public MapRun describeMapRun(String mapRunArn) {
+        return mapRunStore.get(mapRunArn)
+                .orElseThrow(() -> new AwsException("ResourceNotFound",
+                        "Resource not found: '" + mapRunArn + "'", 400));
     }
 
     // ──────────────────────────── Tags ────────────────────────────
