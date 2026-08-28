@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.NullNode;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -548,5 +549,69 @@ class JsonataEvaluatorTest {
         JsonNode statesVar = objectMapper.createObjectNode();
         JsonNode result = evaluator.evaluate("{% $map(['{\"a\":1}', '{\"a\":2}'], $parse).a %}", statesVar);
         assertEquals("[1,2]", result.toString());
+    }
+
+    /**
+     * The expression from issue #2667. JSONata optimises the tail call, so it loops instead of
+     * overflowing the stack: nothing is thrown, and before the time bound the execution stayed
+     * RUNNING for ever with a core pinned. The evaluator is built with a 250 ms bound rather than
+     * the shipped {@link JsonataEvaluator#EVALUATION_TIMEOUT_MILLIS} so the suite stays fast, and
+     * the method timeout makes an unbounded evaluation fail the test instead of blocking the run.
+     */
+    @Test
+    @Timeout(30)
+    void recursionWithNoBaseCaseFailsOnTheTimeBound() {
+        JsonataEvaluator shortlyBounded =
+                new JsonataEvaluator(objectMapper, 250, JsonataEvaluator.MAX_EVALUATION_DEPTH);
+        JsonNode statesVar = objectMapper.createObjectNode();
+
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> shortlyBounded.evaluate("{% ($f := function($x){ $f($x+1) }; $f(1)) %}", statesVar));
+
+        assertEquals("States.QueryEvaluationError", ex.error);
+        assertEquals("JSonataException Expression evaluation timeout: Check for infinite loop", ex.cause);
+    }
+
+    /**
+     * Recursion the library cannot optimise grows the evaluation nesting instead of looping, and
+     * without a depth bound it ends in a StackOverflowError, which is an Error and so escapes the
+     * evaluator's catch. The shipped bound is what turns it into a state failure.
+     */
+    @Test
+    @Timeout(30)
+    void nonTailRecursionFailsOnTheDepthBound() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluate(
+                        "{% ($f := function($x){ $x <= 0 ? 0 : 1 + $f($x-1) }; $f(1000000)) %}", statesVar));
+
+        assertEquals("States.QueryEvaluationError", ex.error);
+        assertEquals("JSonataException Stack overflow error: Check for non-terminating recursive"
+                + " function.  Consider rewriting as tail-recursive. Depth=501 max=500", ex.cause);
+    }
+
+    /**
+     * The boundary from below: the risk of a bound is that it fails a working state machine, so
+     * these must all still evaluate. Measured with {@code aws stepfunctions test-state}, AWS
+     * returns 30 for the first and 800000 for the second, which makes them the ceiling of what
+     * AWS itself accepts on each axis: it refuses the recursion at n=40 (nesting depth 125) and
+     * the sequence at 900,000 elements.
+     *
+     * <p>The last two AWS refuses on its memory limit and Floci evaluates, which is where the
+     * bounds are deliberately looser than AWS rather than tighter.
+     */
+    @Test
+    @Timeout(60)
+    void expensiveButLegitimateExpressionsStayWithinTheShippedBounds() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        String recursionHead = "{% ($f := function($x){ $x <= 0 ? 0 : 1 + $f($x-1) }; $f(";
+
+        assertEquals(30, evaluator.evaluate(recursionHead + "30)) %}", statesVar).asInt());
+        assertEquals(800000, evaluator.evaluate("{% [1..800000] ~> $count() %}", statesVar).asInt());
+
+        assertEquals(160, evaluator.evaluate(recursionHead + "160)) %}", statesVar).asInt());
+        assertEquals(40000200000L,
+                evaluator.evaluate("{% $sum($map([1..200000], function($v){$v * 2})) %}", statesVar).asLong());
     }
 }

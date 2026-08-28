@@ -53,12 +53,49 @@ public class JsonataEvaluator {
      */
     private static final double LARGEST_EXACT_LONG_AS_DOUBLE = 9.223372036854776E18;
 
+    /**
+     * How long one expression may evaluate before the state fails with
+     * {@code States.QueryEvaluationError}. AWS bounds evaluation and Floci did not, so an
+     * expression with no base case pinned a core and left the execution {@code RUNNING} for ever.
+     * JSONata optimises the tail call, so such an expression loops instead of overflowing the
+     * stack: no {@code Error} is thrown and only a clock can end it.
+     *
+     * <p>Five seconds is the dashjoin library's own default and roughly fifty times the slowest
+     * evaluation of a payload AWS itself accepts: AWS refuses a sequence of 900,000 elements on
+     * its memory limit, and summing one that size here takes about 100 ms. Deliberately generous,
+     * because a bound that fails a working state machine costs more than one that lets a runaway
+     * expression burn a core for five seconds.
+     */
+    static final long EVALUATION_TIMEOUT_MILLIS = 5_000;
+
+    /**
+     * How deep evaluation may nest before the state fails. A non-tail-recursive function nests at
+     * roughly {@code 3n+5} for {@code $f(n)}; measured against AWS with {@code test-state}, AWS
+     * accepts {@code n=30} (depth 95) and refuses {@code n=40} (depth 125), so its own ceiling
+     * sits near 100. Five times that leaves no expression AWS accepts able to reach this bound,
+     * and it still trips before the JVM stack does: on a 1 MB thread stack the bound raises a
+     * JSONata error while 1000 or more overflows the stack instead.
+     */
+    static final int MAX_EVALUATION_DEPTH = 500;
+
     private final ObjectMapper objectMapper;
     private final ObjectReader strictJsonReader;
     private final Map<String, Jsonata.JFunction> stepFunctionsExtensions;
+    private final long evaluationTimeoutMillis;
+    private final int maxEvaluationDepth;
 
     @Inject
     public JsonataEvaluator(ObjectMapper objectMapper) {
+        this(objectMapper, EVALUATION_TIMEOUT_MILLIS, MAX_EVALUATION_DEPTH);
+    }
+
+    /**
+     * Bounds evaluation at values other than the shipped ones, so a test can trip the time bound
+     * without waiting {@link #EVALUATION_TIMEOUT_MILLIS} for it.
+     */
+    JsonataEvaluator(ObjectMapper objectMapper, long evaluationTimeoutMillis, int maxEvaluationDepth) {
+        this.evaluationTimeoutMillis = evaluationTimeoutMillis;
+        this.maxEvaluationDepth = maxEvaluationDepth;
         this.objectMapper = objectMapper;
         // AWS rejects what a lenient parser accepts: a second document after the first, a repeated
         // key, an empty string. All three come back as D3137 there, so $parse reads through this
@@ -105,6 +142,10 @@ public class JsonataEvaluator {
         try {
             Jsonata jsonataExpr = jsonata(expr);
             Jsonata.Frame frame = jsonataExpr.createFrame();
+            // Without this the library evaluates unbounded: a recursive expression with no base
+            // case loops for ever and the execution never leaves RUNNING. The bounds raise a
+            // JSONata error, which the catch below turns into States.QueryEvaluationError.
+            frame.setRuntimeBounds(evaluationTimeoutMillis, maxEvaluationDepth);
             stepFunctionsExtensions.forEach(frame::bind);
             // Workflow variables (the Assign field) are referenced as top-level $name in AWS's
             // JSONata dialect, e.g. $CheckpointCount. They are bound alongside $states, never
