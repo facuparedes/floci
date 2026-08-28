@@ -2089,8 +2089,10 @@ public class AslExecutor {
      * one place an ASL author reads the Map run ARN, so a run without a {@code ResultWriter}
      * {@code Resource} has no ARN anybody could describe.
      *
-     * <p>The run's window spans the first item's start to the last item's stop, which is what the
-     * child timings already collected for the export record.
+     * <p>The run starts with its first item, taken from the child timings the export record already
+     * collected, and stops here: the {@code ResultWriter} export has just returned, and AWS closes
+     * a Map run's window on the export rather than on the last item. A run over no items starts and
+     * stops at that same instant.
      */
     private void recordMapRun(JsonNode mapResult, JsonNode context, List<long[]> childTimings,
                               int requestedConcurrency) {
@@ -2098,12 +2100,10 @@ public class AslExecutor {
         if (mapRunArn == null) {
             return;
         }
-        long now = System.currentTimeMillis();
-        long start = now;
-        long stop = now;
+        long stop = System.currentTimeMillis();
+        long start = stop;
         for (long[] timing : childTimings) {
             start = Math.min(start, timing[0]);
-            stop = Math.max(stop, timing[1]);
         }
 
         MapRun mapRun = new MapRun();
