@@ -618,4 +618,117 @@ class JsonataEvaluatorTest {
         assertEquals("[\"100000000000000000000\",\"1e+21\"]",
                 evaluator.evaluate("{% $map([1e20, 1e21], $string) %}", statesVar).toString());
     }
+
+    // ---- the cause of a States.QueryEvaluationError (#2668) ----
+    // Every expected string below was captured from real AWS through test-state, minus the
+    // "The JSONata expression '...' specified for the field '...' threw an error during
+    // evaluation." prefix AWS puts in front of it, which needs the field path #2665 threads.
+
+    @Test
+    void theCauseCarriesTheJsonataErrorCode() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluate("{% $split('a','b',-1) %}", statesVar));
+        assertEquals("D3020: Third argument of split function must evaluate to a positive number",
+                ex.cause);
+    }
+
+    @Test
+    void theErrorNameStaysQueryEvaluationErrorSoACatchStillMatchesIt() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        for (String expression : new String[]{"$sum(['a'])", "1 < 'a'", "$sqrt(-1)",
+                "$each('x', function($v){$v})", "$parse(null)"}) {
+            AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                    () -> evaluator.evaluate("{% " + expression + " %}", statesVar),
+                    "expected " + expression + " to fail");
+            assertEquals("States.QueryEvaluationError", ex.error,
+                    "wrong error name for " + expression);
+        }
+    }
+
+    @Test
+    void aFunctionNameIsNamedAsAFunctionAndNotAsAnObject() {
+        // dashjoin ships jsonata-js's message catalog with the word "function" replaced by
+        // "Object" throughout, which is 116 of the 117 malformed causes in #2668.
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("T0410: Argument 1 of function \"each\" does not match function signature",
+                assertThrows(AslExecutor.FailStateException.class,
+                        () -> evaluator.evaluate("{% $each('x', function($v){$v}) %}", statesVar)).cause);
+        assertEquals("D3050: The second argument of reduce function must be a function"
+                        + " with at least two arguments",
+                assertThrows(AslExecutor.FailStateException.class,
+                        () -> evaluator.evaluate("{% $reduce([1,2], function($a){$a}) %}", statesVar)).cause);
+        assertEquals("D3138: The $single() function expected exactly 1 matching result. "
+                        + " Instead it matched more.",
+                assertThrows(AslExecutor.FailStateException.class,
+                        () -> evaluator.evaluate("{% $single([1,2], function($x){true}) %}", statesVar)).cause);
+    }
+
+    @Test
+    void anArrayElementTypeIsNamedInsteadOfLeftAsATypePlaceholder() {
+        // T0412 is the one code in the catalog carrying both defects: the "Object" word and a
+        // third placeholder that dashjoin's two-slot substituter never reaches. It also carries
+        // neither the argument index nor the function name AWS names, so the cause states what
+        // the library does hand over: the offending argument and the element type it wanted.
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("T0412: Argument [\"a\"] must be an array of \"numbers\"",
+                assertThrows(AslExecutor.FailStateException.class,
+                        () -> evaluator.evaluate("{% $sum(['a']) %}", statesVar)).cause);
+        assertEquals("T0412: Argument [\"a\",\"b\"] must be an array of \"numbers\"",
+                assertThrows(AslExecutor.FailStateException.class,
+                        () -> evaluator.evaluate("{% $average(['a','b']) %}", statesVar)).cause);
+    }
+
+    @Test
+    void bothComparedValuesAreNamedInsteadOfLeftAsATokenPlaceholder() {
+        // T2009 is the other three-placeholder code, and the only one of the 117 whose leftover
+        // is {{token}}. The operator is not carried either, so the cause names the two values.
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("T2009: The values 1 and \"a\" either side of the operator"
+                        + " must be of the same data type",
+                assertThrows(AslExecutor.FailStateException.class,
+                        () -> evaluator.evaluate("{% 1 < 'a' %}", statesVar)).cause);
+        assertEquals("T2009: The values \"a\" and 1 either side of the operator"
+                        + " must be of the same data type",
+                assertThrows(AslExecutor.FailStateException.class,
+                        () -> evaluator.evaluate("{% 'a' < 1 %}", statesVar)).cause);
+    }
+
+    @Test
+    void aMessageThrownInPlaceOfACodeIsNotPrefixedWithJSonataException() {
+        // dashjoin's own catalog lookup falls back to "JSonataException " + code, and both this
+        // class's six functions and a handful of library call sites throw with the whole message
+        // in the code slot. AWS emits neither that prefix nor the class name.
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("T0410: Argument 1 of function \"parse\" does not match function signature",
+                assertThrows(AslExecutor.FailStateException.class,
+                        () -> evaluator.evaluate("{% $parse(null) %}", statesVar)).cause);
+        assertEquals("Second argument of replace function cannot be an empty string",
+                assertThrows(AslExecutor.FailStateException.class,
+                        () -> evaluator.evaluate("{% $replace('a','','b') %}", statesVar)).cause);
+    }
+
+    @Test
+    void aValueSubstitutedIntoTheMessageIsRenderedAsJson() {
+        // dashjoin quotes every value it substitutes; jsonata-js and AWS JSON-render it, so a
+        // number stays bare and an array keeps its brackets.
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("D3060: The sqrt function cannot be applied to a negative number: -1",
+                assertThrows(AslExecutor.FailStateException.class,
+                        () -> evaluator.evaluate("{% $sqrt(-1) %}", statesVar)).cause);
+        assertEquals("T2002: The right side of the \"+\" operator must evaluate to a number",
+                assertThrows(AslExecutor.FailStateException.class,
+                        () -> evaluator.evaluate("{% 1 + {} %}", statesVar)).cause);
+    }
+
+    @Test
+    void aNonJsonataFailureKeepsTheMessageItCameWith() {
+        // dashjoin lets a plain Java exception out of a few functions. There is no code and no
+        // template to render, and swallowing the message would lose the only diagnosis there is.
+        JsonNode statesVar = objectMapper.createObjectNode();
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluate("{% $toMillis('nope') %}", statesVar));
+        assertEquals("States.QueryEvaluationError", ex.error);
+        assertTrue(ex.cause.contains("nope"), ex.cause);
+    }
 }
