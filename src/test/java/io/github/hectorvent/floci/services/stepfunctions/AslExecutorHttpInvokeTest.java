@@ -285,6 +285,47 @@ class AslExecutorHttpInvokeTest {
     }
 
     @Test
+    void jsonataArgumentsSendAnExplicitNullAndOmitOnlyWhatReturnedNothing() throws Exception {
+        // AWS keeps the null in the arguments a Task is invoked with: TestState TRACE reports
+        // afterArguments {"FunctionName":"nope","Payload":{"v":null}} for Payload {"v":"{% null %}"}.
+        Execution execution = run("""
+                {
+                  "QueryLanguage": "JSONata",
+                  "StartAt": "CallHttp",
+                  "States": {
+                    "CallHttp": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::http:invoke",
+                      "Arguments": {
+                        "ApiEndpoint": "%s/text",
+                        "Method": "POST",
+                        "Authentication": {
+                          "ConnectionArn": "%s"
+                        },
+                        "RequestBody": {
+                          "fromInput": "{%% $lookup($states.input, 'customerId') %%}",
+                          "returnedNothing": "{%% $states.input.absent %%}",
+                          "active": true
+                        }
+                      },
+                      "End": true
+                    }
+                  }
+                }
+                """.formatted(baseUrl, CONNECTION_ARN), """
+                {
+                  "customerId": null
+                }
+                """);
+
+        assertEquals("SUCCEEDED", execution.getStatus(), execution.getCause());
+        JsonNode body = objectMapper.readTree(onlyRequest().body());
+        assertTrue(body.path("fromInput").isNull(), body.toString());
+        assertTrue(body.path("returnedNothing").isMissingNode(), body.toString());
+        assertTrue(body.path("active").asBoolean());
+    }
+
+    @Test
     void nonSuccessStatusFailsWithStatesHttpStatusCodeError() throws Exception {
         Execution execution = run("""
                 {

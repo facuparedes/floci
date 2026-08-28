@@ -66,6 +66,22 @@ uniformly between zero and the computed delay, as on AWS. One deviation. The del
 between attempts is capped at 30 seconds, the same cap Floci applies to `Wait` states,
 so emulated runs stay fast.
 
+## JSONata nulls
+
+An expression that evaluates to JSON `null` produces a value, not a missing one. It keeps its key
+in `Output`, in `Assign` and in a Task's `Arguments`, at any nesting depth, and it stays in place as
+an array element:
+
+```
+"Output": {"v": "{% $states.input.bar %}"}   on input {"bar": null}   ->   {"v": null}
+```
+
+The same `null` is a value inside the expression too: `$exists()` on it is true and `$type()` on it
+is `"null"`. Only an expression that returns nothing loses its key, which is what
+`$states.input.absent` and the functions listed below that evaluate to undefined do.
+
+One deviation. `$count()` on a JSON null answers `0`; AWS answers `1`.
+
 ## JSONata functions
 
 State machines with `"QueryLanguage": "JSONata"` reach the six functions Step Functions adds on

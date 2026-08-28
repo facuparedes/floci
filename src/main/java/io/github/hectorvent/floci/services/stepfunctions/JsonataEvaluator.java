@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.MissingNode;
 import com.fasterxml.jackson.databind.node.NullNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -125,6 +126,11 @@ public class JsonataEvaluator {
         String expr = isExpression(expression) ? unwrap(expression) : expression;
         try {
             Jsonata jsonataExpr = jsonata(expr);
+            // Off, the library keeps JSONata's null marker in the result instead of flattening it
+            // into a Java null. On, an expression that evaluated to JSON null and one that returned
+            // nothing both arrive here as a Java null, and AWS keeps the first while dropping the
+            // second.
+            jsonataExpr.setOutputConvertNulls(false);
             Jsonata.Frame frame = jsonataExpr.createFrame();
             stepFunctionsExtensions.forEach(frame::bind);
             // Workflow variables (the Assign field) are referenced as top-level $name in AWS's
@@ -220,7 +226,7 @@ public class JsonataEvaluator {
     }
 
     JsonNode resolveTemplate(JsonNode template, JsonNode statesVar, JsonNode variables) {
-        if (template == null || template.isNull() || template.isMissingNode()) {
+        if (template == null || template.isMissingNode()) {
             return template;
         }
         if (template.isTextual()) {
@@ -236,9 +242,10 @@ public class JsonataEvaluator {
             while (fields.hasNext()) {
                 Map.Entry<String, JsonNode> entry = fields.next();
                 JsonNode value = resolveTemplate(entry.getValue(), statesVar, variables);
-                // Per JSONata spec: undefined (null) values are omitted from object output,
-                // matching real AWS Step Functions behavior.
-                if (value != null && !value.isNull() && !value.isMissingNode()) {
+                // Per JSONata spec: an expression that returned nothing is omitted from object
+                // output, matching real AWS Step Functions behavior. A JSON null is a value and
+                // keeps its key: AWS answers {"v":null} to Output {"v":"{% null %}"}.
+                if (value != null && !value.isMissingNode()) {
                     resolved.set(entry.getKey(), value);
                 }
             }
@@ -249,9 +256,10 @@ public class JsonataEvaluator {
             for (int i = 0; i < template.size(); i++) {
                 JsonNode element = template.get(i);
                 JsonNode value = resolveTemplate(element, statesVar, variables);
-                // Per real AWS behavior: undefined array elements fail the execution.
+                // Per real AWS behavior: an array element that returned nothing fails the execution.
                 // Unlike object fields (which are omitted), undefined in an array is a runtime error.
-                if (value == null || value.isNull() || value.isMissingNode()) {
+                // A JSON null is a value and stays: AWS answers [null,1] to ["{% null %}",1].
+                if (value == null || value.isMissingNode()) {
                     String expr = element.isTextual() ? element.asText() : element.toString();
                     throw new FailStateException("States.Runtime",
                             "The JSONata expression '" + expr + "' at array index " + i + " returned nothing (undefined).");
@@ -264,16 +272,41 @@ public class JsonataEvaluator {
         return template;
     }
 
-    private Object toObject(JsonNode node) {
-        if (node == null || node.isNull() || node.isMissingNode()) {
+    /**
+     * Binds $states and the workflow variables as JSONata values, so a JSON null inside them stays
+     * a null the expression can see: $exists() on it is true and $type() on it is "null", as on
+     * AWS. Only an absent node is undefined.
+     */
+    private static Object toObject(JsonNode node) {
+        if (node == null || node.isMissingNode()) {
             return null;
         }
-        return objectMapper.convertValue(node, Object.class);
+        return toJsonataValue(node);
     }
 
+    /**
+     * The evaluation result. A Java null is the expression returning nothing, which
+     * {@link #resolveTemplate} drops from an object; the JSONata null marker is a JSON null, which
+     * it keeps. Nested inside an object or an array there is no undefined, so every null there is
+     * a JSON null.
+     */
     private JsonNode toJsonNode(Object value) {
-        if (value == null) {
+        return value == null ? MissingNode.getInstance() : fromJsonataValue(value);
+    }
+
+    private JsonNode fromJsonataValue(Object value) {
+        if (value == null || value == Jsonata.NULL_VALUE) {
             return NullNode.getInstance();
+        }
+        if (value instanceof Map<?, ?> map) {
+            ObjectNode object = objectMapper.createObjectNode();
+            map.forEach((key, element) -> object.set(String.valueOf(key), fromJsonataValue(element)));
+            return object;
+        }
+        if (value instanceof List<?> list) {
+            ArrayNode array = objectMapper.createArrayNode();
+            list.forEach(element -> array.add(fromJsonataValue(element)));
+            return array;
         }
         return objectMapper.valueToTree(value);
     }

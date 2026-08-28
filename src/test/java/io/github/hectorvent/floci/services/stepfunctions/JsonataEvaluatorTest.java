@@ -84,12 +84,12 @@ class JsonataEvaluatorTest {
     }
 
     @Test
-    void evaluate_returnsNullForMissingField() throws Exception {
+    void evaluate_returnsNothingForMissingField() throws Exception {
         JsonNode statesVar = objectMapper.readTree("""
                 {"input": {"name": "Alice"}}
                 """);
         JsonNode result = evaluator.evaluate("{% $states.input.missing %}", statesVar);
-        assertTrue(result.isNull());
+        assertTrue(result.isMissingNode());
     }
 
     @Test
@@ -215,7 +215,7 @@ class JsonataEvaluatorTest {
     void parse_noArgumentReturnsUndefined() {
         JsonNode statesVar = objectMapper.createObjectNode();
         JsonNode result = evaluator.evaluate("{% $parse() %}", statesVar);
-        assertTrue(result.isNull());
+        assertTrue(result.isMissingNode());
     }
 
     @Test
@@ -259,14 +259,14 @@ class JsonataEvaluatorTest {
     void partition_emptyArrayReturnsUndefined() {
         JsonNode statesVar = objectMapper.createObjectNode();
         JsonNode result = evaluator.evaluate("{% $partition([], 2) %}", statesVar);
-        assertTrue(result.isNull());
+        assertTrue(result.isMissingNode());
     }
 
     @Test
     void partition_chunkSizeZeroReturnsUndefined() {
         JsonNode statesVar = objectMapper.createObjectNode();
         JsonNode result = evaluator.evaluate("{% $partition([1,2,3], 0) %}", statesVar);
-        assertTrue(result.isNull());
+        assertTrue(result.isMissingNode());
     }
 
     @Test
@@ -318,21 +318,21 @@ class JsonataEvaluatorTest {
     void range_wrongSignStepReturnsUndefined() {
         JsonNode statesVar = objectMapper.createObjectNode();
         JsonNode result = evaluator.evaluate("{% $range(5, 1, 1) %}", statesVar);
-        assertTrue(result.isNull());
+        assertTrue(result.isMissingNode());
     }
 
     @Test
     void range_stepZeroReturnsUndefined() {
         JsonNode statesVar = objectMapper.createObjectNode();
         JsonNode result = evaluator.evaluate("{% $range(1, 5, 0) %}", statesVar);
-        assertTrue(result.isNull());
+        assertTrue(result.isMissingNode());
     }
 
     @Test
     void range_missingStepReturnsUndefined() {
         JsonNode statesVar = objectMapper.createObjectNode();
         JsonNode result = evaluator.evaluate("{% $range(1, 5) %}", statesVar);
-        assertTrue(result.isNull());
+        assertTrue(result.isMissingNode());
     }
 
     @Test
@@ -374,7 +374,7 @@ class JsonataEvaluatorTest {
     void hash_missingAlgorithmReturnsUndefined() {
         JsonNode statesVar = objectMapper.createObjectNode();
         JsonNode result = evaluator.evaluate("{% $hash('Hello') %}", statesVar);
-        assertTrue(result.isNull());
+        assertTrue(result.isMissingNode());
     }
 
     @Test
@@ -449,7 +449,7 @@ class JsonataEvaluatorTest {
         assertEquals("[-2,-1,0]", evaluator.evaluate("{% $range(-2.9, 0, 1) %}", statesVar).toString());
         assertEquals("[5,4,3,2,1]", evaluator.evaluate("{% $range(5, 1, -1.5) %}", statesVar).toString());
         // -0.5 rounds to 0, which is undefined, while -2 stays negative and is an error.
-        assertTrue(evaluator.evaluate("{% $partition([1,2,3,4], -0.5) %}", statesVar).isNull());
+        assertTrue(evaluator.evaluate("{% $partition([1,2,3,4], -0.5) %}", statesVar).isMissingNode());
     }
 
     @Test
@@ -479,7 +479,7 @@ class JsonataEvaluatorTest {
     @Test
     void hash_missingAlgorithmIsUndefinedButNonStringOneIsASignatureError() {
         JsonNode statesVar = objectMapper.createObjectNode();
-        assertTrue(evaluator.evaluate("{% $hash('a') %}", statesVar).isNull());
+        assertTrue(evaluator.evaluate("{% $hash('a') %}", statesVar).isMissingNode());
         AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
                 () -> evaluator.evaluate("{% $hash('a', 5) %}", statesVar));
         assertTrue(ex.cause.contains("T0410"));
@@ -730,5 +730,85 @@ class JsonataEvaluatorTest {
                 () -> evaluator.evaluate("{% $toMillis('nope') %}", statesVar));
         assertEquals("States.QueryEvaluationError", ex.error);
         assertTrue(ex.cause.contains("nope"), ex.cause);
+    }
+
+    @Test
+    void anExplicitNullKeepsItsKeyAndOnlyWhatReturnedNothingIsDropped() throws Exception {
+        JsonNode statesVar = objectMapper.readTree("""
+                {"input": {"bar": null}}
+                """);
+        JsonNode template = objectMapper.readTree("""
+                {"fromInput": "{% $lookup($states.input, 'bar') %}",
+                 "returnedNothing": "{% $states.input.absent %}",
+                 "kept": 1}
+                """);
+
+        assertEquals("{\"fromInput\":null,\"kept\":1}",
+                evaluator.resolveTemplate(template, statesVar).toString());
+    }
+
+    @Test
+    void anExplicitNullSurvivesInsideANestedObject() throws Exception {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode template = objectMapper.readTree("""
+                {"outer": {"fromExpression": "{% null %}", "kept": 1}}
+                """);
+
+        assertEquals("{\"outer\":{\"fromExpression\":null,\"kept\":1}}",
+                evaluator.resolveTemplate(template, statesVar).toString());
+    }
+
+    @Test
+    void aWholeTemplateEvaluatingToNullIsANullWhileNothingIsAMissingNode() throws Exception {
+        JsonNode statesVar = objectMapper.createObjectNode();
+
+        assertTrue(evaluator.resolveTemplate(objectMapper.readTree("\"{% null %}\""), statesVar).isNull());
+        assertTrue(evaluator.resolveTemplate(objectMapper.readTree("\"{% $states.input.absent %}\""), statesVar)
+                .isMissingNode());
+    }
+
+    @Test
+    void anExplicitNullIsAnArrayElementWhileNothingStillFailsTheState() throws Exception {
+        JsonNode statesVar = objectMapper.createObjectNode();
+
+        assertEquals("{\"values\":[null,1]}", evaluator.resolveTemplate(objectMapper.readTree("""
+                {"values": ["{% null %}", 1]}
+                """), statesVar).toString());
+
+        AslExecutor.FailStateException failure = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.resolveTemplate(objectMapper.readTree("""
+                        {"values": ["{% $states.input.absent %}"]}
+                        """), statesVar));
+        assertTrue(failure.cause.contains("returned nothing (undefined)"), failure.cause);
+    }
+
+    @Test
+    void aLiteralNullInTheTemplateKeepsItsKey() throws Exception {
+        JsonNode statesVar = objectMapper.createObjectNode();
+
+        assertEquals("{\"literal\":null,\"kept\":1}", evaluator.resolveTemplate(objectMapper.readTree("""
+                {"literal": null, "kept": 1}
+                """), statesVar).toString());
+    }
+
+    @Test
+    void anInputNullIsAValueForExistsAndType() throws Exception {
+        JsonNode statesVar = objectMapper.readTree("""
+                {"input": {"bar": null}}
+                """);
+
+        assertTrue(evaluator.evaluate("{% $exists($states.input.bar) %}", statesVar).asBoolean());
+        assertEquals("null", evaluator.evaluate("{% $type($states.input.bar) %}", statesVar).asText());
+    }
+
+    @Test
+    void anAssignedNullReadsBackAsANull() throws Exception {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode variables = objectMapper.readTree("""
+                {"nullVariable": null}
+                """);
+
+        assertTrue(evaluator.evaluate("{% $nullVariable %}", statesVar, variables).isNull());
+        assertTrue(evaluator.evaluate("{% $exists($nullVariable) %}", statesVar, variables).asBoolean());
     }
 }
