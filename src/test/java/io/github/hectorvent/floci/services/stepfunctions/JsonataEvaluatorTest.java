@@ -759,12 +759,15 @@ class JsonataEvaluatorTest {
     }
 
     @Test
-    void aWholeTemplateEvaluatingToNullIsANullWhileNothingIsAMissingNode() throws Exception {
+    void aWholeTemplateIsANullWhetherItEvaluatedToNullOrReturnedNothing() throws Exception {
         JsonNode statesVar = objectMapper.createObjectNode();
 
         assertTrue(evaluator.resolveTemplate(objectMapper.readTree("\"{% null %}\""), statesVar).isNull());
+        // AWS fails the second one with States.QueryEvaluationError, which #2665 covers. Until then
+        // it is a null and not a missing node: an Output or Arguments is serialized as it stands,
+        // and a missing node writes itself as the empty string rather than as JSON.
         assertTrue(evaluator.resolveTemplate(objectMapper.readTree("\"{% $states.input.absent %}\""), statesVar)
-                .isMissingNode());
+                .isNull());
     }
 
     @Test

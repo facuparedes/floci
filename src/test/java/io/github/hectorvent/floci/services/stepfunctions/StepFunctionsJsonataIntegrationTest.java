@@ -1298,6 +1298,32 @@ class StepFunctionsJsonataIntegrationTest {
     }
 
     @Test
+    void aWholeOutputThatReturnedNothingStaysReadableJson() throws Exception {
+        // AWS fails this state with States.QueryEvaluationError, which #2665 covers. Until then the
+        // execution succeeds, and what DescribeExecution hands back has to parse: an output field
+        // holding the empty string is not JSON any client can read.
+        String definition = """
+                {
+                    "QueryLanguage": "JSONata",
+                    "StartAt": "Transform",
+                    "States": {
+                        "Transform": {
+                            "Type": "Pass",
+                            "Output": "{% $states.input.absent %}",
+                            "End": true
+                        }
+                    }
+                }
+                """;
+
+        String smArn = createStateMachine("jsonata-whole-output-nothing-test", definition);
+        String execArn = startExecution(smArn, "{}");
+        String output = waitForExecution(execArn);
+
+        assertTrue(objectMapper.readTree(output).isNull(), output);
+    }
+
+    @Test
     void assignedVariablesSurviveBeyondNextStateOutput() throws Exception {
         // Variables set via Assign persist across states even after a later state replaces the output.
         String definition = """

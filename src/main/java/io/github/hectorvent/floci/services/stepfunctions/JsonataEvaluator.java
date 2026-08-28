@@ -229,6 +229,15 @@ public class JsonataEvaluator {
         if (template == null || template.isMissingNode()) {
             return template;
         }
+        JsonNode resolved = resolveTemplateNode(template, statesVar, variables);
+        // A resolved Output or Arguments is serialized as it stands, and a missing node writes
+        // itself as the empty string, which no client can parse. "Returned nothing" is a value only
+        // in the positions resolveTemplateNode reads it in: an object field it drops, an array
+        // element it fails the state on. As the whole field there is nothing to drop it from.
+        return resolved.isMissingNode() ? NullNode.getInstance() : resolved;
+    }
+
+    private JsonNode resolveTemplateNode(JsonNode template, JsonNode statesVar, JsonNode variables) {
         if (template.isTextual()) {
             String text = template.asText();
             if (isExpression(text)) {
@@ -241,11 +250,11 @@ public class JsonataEvaluator {
             Iterator<Map.Entry<String, JsonNode>> fields = template.fields();
             while (fields.hasNext()) {
                 Map.Entry<String, JsonNode> entry = fields.next();
-                JsonNode value = resolveTemplate(entry.getValue(), statesVar, variables);
+                JsonNode value = resolveTemplateNode(entry.getValue(), statesVar, variables);
                 // Per JSONata spec: an expression that returned nothing is omitted from object
                 // output, matching real AWS Step Functions behavior. A JSON null is a value and
                 // keeps its key: AWS answers {"v":null} to Output {"v":"{% null %}"}.
-                if (value != null && !value.isMissingNode()) {
+                if (!value.isMissingNode()) {
                     resolved.set(entry.getKey(), value);
                 }
             }
@@ -255,11 +264,11 @@ public class JsonataEvaluator {
             ArrayNode resolved = objectMapper.createArrayNode();
             for (int i = 0; i < template.size(); i++) {
                 JsonNode element = template.get(i);
-                JsonNode value = resolveTemplate(element, statesVar, variables);
+                JsonNode value = resolveTemplateNode(element, statesVar, variables);
                 // Per real AWS behavior: an array element that returned nothing fails the execution.
                 // Unlike object fields (which are omitted), undefined in an array is a runtime error.
                 // A JSON null is a value and stays: AWS answers [null,1] to ["{% null %}",1].
-                if (value == null || value.isMissingNode()) {
+                if (value.isMissingNode()) {
                     String expr = element.isTextual() ? element.asText() : element.toString();
                     throw new FailStateException("States.Runtime",
                             "The JSONata expression '" + expr + "' at array index " + i + " returned nothing (undefined).");
@@ -268,7 +277,7 @@ public class JsonataEvaluator {
             }
             return resolved;
         }
-        // Primitives (number, boolean) pass through
+        // Primitives (number, boolean, null) pass through
         return template;
     }
 
@@ -286,9 +295,9 @@ public class JsonataEvaluator {
 
     /**
      * The evaluation result. A Java null is the expression returning nothing, which
-     * {@link #resolveTemplate} drops from an object; the JSONata null marker is a JSON null, which
-     * it keeps. Nested inside an object or an array there is no undefined, so every null there is
-     * a JSON null.
+     * {@link #resolveTemplateNode} drops from an object; the JSONata null marker is a JSON null,
+     * which it keeps. Nested inside an object or an array there is no undefined, so every null
+     * there is a JSON null.
      */
     private JsonNode toJsonNode(Object value) {
         return value == null ? MissingNode.getInstance() : fromJsonataValue(value);
