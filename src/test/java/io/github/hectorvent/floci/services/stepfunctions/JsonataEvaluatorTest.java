@@ -6,6 +6,11 @@ import com.fasterxml.jackson.databind.node.NullNode;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -97,7 +102,7 @@ class JsonataEvaluatorTest {
     void resolveTemplate_nonExpressionStringPassesThrough() throws Exception {
         JsonNode template = objectMapper.readTree("\"plain text\"");
         JsonNode statesVar = objectMapper.createObjectNode();
-        JsonNode result = evaluator.resolveTemplate(template, statesVar);
+        JsonNode result = evaluator.resolveTemplate(template, "Output", statesVar);
         assertEquals("plain text", result.asText());
     }
 
@@ -105,7 +110,7 @@ class JsonataEvaluatorTest {
     void resolveTemplate_evaluatesExpressionInString() throws Exception {
         JsonNode template = objectMapper.readTree("\"{% 1 + 1 %}\"");
         JsonNode statesVar = objectMapper.createObjectNode();
-        JsonNode result = evaluator.resolveTemplate(template, statesVar);
+        JsonNode result = evaluator.resolveTemplate(template, "Output", statesVar);
         assertEquals(2, result.asInt());
     }
 
@@ -121,7 +126,7 @@ class JsonataEvaluatorTest {
         JsonNode statesVar = objectMapper.readTree("""
                 {"input": {"name": "Bob"}}
                 """);
-        JsonNode result = evaluator.resolveTemplate(template, statesVar);
+        JsonNode result = evaluator.resolveTemplate(template, "Output", statesVar);
         assertTrue(result.isObject());
         assertEquals("Hello Bob", result.get("greeting").asText());
         assertEquals("unchanged", result.get("static").asText());
@@ -136,7 +141,7 @@ class JsonataEvaluatorTest {
         JsonNode statesVar = objectMapper.readTree("""
                 {"input": {"a": 1, "b": 2}}
                 """);
-        JsonNode result = evaluator.resolveTemplate(template, statesVar);
+        JsonNode result = evaluator.resolveTemplate(template, "Output", statesVar);
         assertTrue(result.isArray());
         assertEquals(1, result.get(0).asInt());
         assertEquals("static", result.get(1).asText());
@@ -150,7 +155,7 @@ class JsonataEvaluatorTest {
         JsonNode statesVar = objectMapper.readTree("""
                 {"input": {"name": "Alice", "age": 30}}
                 """);
-        JsonNode result = evaluator.resolveTemplate(template, statesVar);
+        JsonNode result = evaluator.resolveTemplate(template, "Output", statesVar);
         assertTrue(result.isTextual());
         assertEquals("Hello {% $states.input.name %}, you are {% $states.input.age %} years old", result.asText());
     }
@@ -161,7 +166,7 @@ class JsonataEvaluatorTest {
         JsonNode statesVar = objectMapper.readTree("""
                 {"input": {"name": "Alice", "age": 30}}
                 """);
-        JsonNode result = evaluator.resolveTemplate(template, statesVar);
+        JsonNode result = evaluator.resolveTemplate(template, "Output", statesVar);
         assertTrue(result.isObject());
         assertEquals("Alice", result.get("name").asText());
     }
@@ -170,9 +175,9 @@ class JsonataEvaluatorTest {
     void resolveTemplate_primitivesPassThrough() throws Exception {
         JsonNode statesVar = objectMapper.createObjectNode();
 
-        assertEquals(42, evaluator.resolveTemplate(objectMapper.readTree("42"), statesVar).asInt());
-        assertTrue(evaluator.resolveTemplate(objectMapper.readTree("true"), statesVar).asBoolean());
-        assertTrue(evaluator.resolveTemplate(NullNode.getInstance(), statesVar).isNull());
+        assertEquals(42, evaluator.resolveTemplate(objectMapper.readTree("42"), "Output", statesVar).asInt());
+        assertTrue(evaluator.resolveTemplate(objectMapper.readTree("true"), "Output", statesVar).asBoolean());
+        assertTrue(evaluator.resolveTemplate(NullNode.getInstance(), "Output", statesVar).isNull());
     }
 
     @Test
@@ -804,18 +809,17 @@ class JsonataEvaluatorTest {
     }
 
     @Test
-    void anExplicitNullKeepsItsKeyAndOnlyWhatReturnedNothingIsDropped() throws Exception {
+    void anExplicitNullKeepsItsKey() throws Exception {
         JsonNode statesVar = objectMapper.readTree("""
                 {"input": {"bar": null}}
                 """);
         JsonNode template = objectMapper.readTree("""
                 {"fromInput": "{% $lookup($states.input, 'bar') %}",
-                 "returnedNothing": "{% $states.input.absent %}",
                  "kept": 1}
                 """);
 
         assertEquals("{\"fromInput\":null,\"kept\":1}",
-                evaluator.resolveTemplate(template, statesVar).toString());
+                evaluator.resolveTemplate(template, "Output", statesVar).toString());
     }
 
     @Test
@@ -826,34 +830,23 @@ class JsonataEvaluatorTest {
                 """);
 
         assertEquals("{\"outer\":{\"fromExpression\":null,\"kept\":1}}",
-                evaluator.resolveTemplate(template, statesVar).toString());
+                evaluator.resolveTemplate(template, "Output", statesVar).toString());
     }
 
     @Test
-    void aWholeTemplateIsANullWhetherItEvaluatedToNullOrReturnedNothing() throws Exception {
+    void aWholeTemplateEvaluatingToNullIsANull() throws Exception {
         JsonNode statesVar = objectMapper.createObjectNode();
 
-        assertTrue(evaluator.resolveTemplate(objectMapper.readTree("\"{% null %}\""), statesVar).isNull());
-        // AWS fails the second one with States.QueryEvaluationError, which #2665 covers. Until then
-        // it is a null and not a missing node: an Output or Arguments is serialized as it stands,
-        // and a missing node writes itself as the empty string rather than as JSON.
-        assertTrue(evaluator.resolveTemplate(objectMapper.readTree("\"{% $states.input.absent %}\""), statesVar)
-                .isNull());
+        assertTrue(evaluator.resolveTemplate(objectMapper.readTree("\"{% null %}\""), "Output", statesVar).isNull());
     }
 
     @Test
-    void anExplicitNullIsAnArrayElementWhileNothingStillFailsTheState() throws Exception {
+    void anExplicitNullIsAnArrayElement() throws Exception {
         JsonNode statesVar = objectMapper.createObjectNode();
 
         assertEquals("{\"values\":[null,1]}", evaluator.resolveTemplate(objectMapper.readTree("""
                 {"values": ["{% null %}", 1]}
-                """), statesVar).toString());
-
-        AslExecutor.FailStateException failure = assertThrows(AslExecutor.FailStateException.class,
-                () -> evaluator.resolveTemplate(objectMapper.readTree("""
-                        {"values": ["{% $states.input.absent %}"]}
-                        """), statesVar));
-        assertTrue(failure.cause.contains("returned nothing (undefined)"), failure.cause);
+                """), "Output", statesVar).toString());
     }
 
     @Test
@@ -862,7 +855,7 @@ class JsonataEvaluatorTest {
 
         assertEquals("{\"literal\":null,\"kept\":1}", evaluator.resolveTemplate(objectMapper.readTree("""
                 {"literal": null, "kept": 1}
-                """), statesVar).toString());
+                """), "Output", statesVar).toString());
     }
 
     @Test
@@ -884,5 +877,55 @@ class JsonataEvaluatorTest {
 
         assertTrue(evaluator.evaluate("{% $nullVariable %}", statesVar, variables).isNull());
         assertTrue(evaluator.evaluate("{% $exists($nullVariable) %}", statesVar, variables).asBoolean());
+    }
+
+    /**
+     * The field path AWS names in the cause: the ASL field the template came from, a {@code /}
+     * before every object key below it and {@code [i]} appended for every array index. Measured on
+     * TestState, one Pass or one Assign per row.
+     */
+    static Stream<Arguments> templatesWhoseExpressionReturnsNothing() {
+        return Stream.of(
+                Arguments.of("{\"v\": \"{% $states.input.missing %}\"}", "Output", "Output/v"),
+                Arguments.of("{\"a\": {\"b\": \"{% $states.input.missing %}\"}}", "Output", "Output/a/b"),
+                Arguments.of("\"{% $states.input.missing %}\"", "Output", "Output"),
+                Arguments.of("{\"values\": [\"{% $states.input.missing %}\", 1]}", "Output", "Output/values[0]"),
+                Arguments.of("{\"a\": {\"b\": [[1, \"{% $states.input.missing %}\"]]}}", "Output", "Output/a/b[0][1]"),
+                Arguments.of("{\"x\": {\"y\": \"{% $states.input.missing %}\"}}", "Assign", "Assign/x/y"));
+    }
+
+    @ParameterizedTest
+    @MethodSource("templatesWhoseExpressionReturnsNothing")
+    void anExpressionReturningNothingFailsTheStateNamingTheFieldPath(String template, String field,
+                                                                     String expectedFieldPath) throws Exception {
+        JsonNode statesVar = objectMapper.readTree("{\"input\": {}}");
+
+        AslExecutor.FailStateException failure = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.resolveTemplate(objectMapper.readTree(template), field, statesVar));
+
+        assertEquals("States.QueryEvaluationError", failure.error);
+        assertEquals("The JSONata expression '$states.input.missing' specified for the field '"
+                + expectedFieldPath + "' returned nothing (undefined).", failure.cause);
+    }
+
+    @Test
+    void evaluateFieldNamesTheFieldOfAPositionThatHoldsASingleExpression() throws Exception {
+        JsonNode statesVar = objectMapper.readTree("{\"input\": {}}");
+
+        AslExecutor.FailStateException failure = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluateField("{% $states.input.missing %}", "Seconds", statesVar, null));
+
+        assertEquals("States.QueryEvaluationError", failure.error);
+        assertEquals("The JSONata expression '$states.input.missing' specified for the field 'Seconds' "
+                + "returned nothing (undefined).", failure.cause);
+    }
+
+    @Test
+    void anExplicitNullIsAValueAndKeepsEveryPositionEvaluating() throws Exception {
+        JsonNode statesVar = objectMapper.readTree("{\"input\": {\"bar\": null}}");
+
+        assertTrue(evaluator.evaluateField("{% null %}", "Seconds", statesVar, null).isNull());
+        assertEquals("{\"v\":null}", evaluator.resolveTemplate(
+                objectMapper.readTree("{\"v\": \"{% $states.input.bar %}\"}"), "Output", statesVar).toString());
     }
 }

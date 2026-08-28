@@ -593,7 +593,8 @@ public class AslExecutor {
             var effectiveInput = input;
             if (stateDef.has("Arguments")) {
                 var statesVar = buildStatesVar(input, null, context);
-                effectiveInput = jsonataEvaluator.resolveTemplate(stateDef.get("Arguments"), statesVar, variables);
+                effectiveInput = jsonataEvaluator.resolveTemplate(
+                        stateDef.get("Arguments"), "Arguments", statesVar, variables);
             }
             taskResult = mockedSteps != null
                     ? mockedTaskResult(mockedSteps, stateName, attempt)
@@ -1650,10 +1651,12 @@ public class AslExecutor {
         if (jsonata) {
             JsonNode statesVar = buildStatesVar(input, null, context);
             JsonNode choices = stateDef.path("Choices");
-            for (JsonNode choice : choices) {
+            for (int i = 0; i < choices.size(); i++) {
+                JsonNode choice = choices.get(i);
                 String condition = choice.path("Condition").asText(null);
                 if (condition != null) {
-                    JsonNode result = jsonataEvaluator.evaluate(condition, statesVar, variables);
+                    JsonNode result = jsonataEvaluator.evaluateField(
+                            condition, "Choices[" + i + "]/Condition", statesVar, variables);
                     if (result.isBoolean() && result.asBoolean()) {
                         // A matched rule carries its own Assign and Output; the state-level ones
                         // belong to the Default path and do not run here.
@@ -1777,7 +1780,8 @@ public class AslExecutor {
                 JsonNode secondsNode = stateDef.get("Seconds");
                 if (secondsNode.isTextual() && JsonataEvaluator.isExpression(secondsNode.asText())) {
                     JsonNode statesVar = buildStatesVar(input, null, context);
-                    JsonNode result = jsonataEvaluator.evaluate(secondsNode.asText(), statesVar, variables);
+                    JsonNode result = jsonataEvaluator.evaluateField(
+                            secondsNode.asText(), "Seconds", statesVar, variables);
                     seconds = Math.min(result.asInt(), MAX_WAIT_SECONDS);
                 } else {
                     seconds = Math.min(secondsNode.asInt(), MAX_WAIT_SECONDS);
@@ -1818,10 +1822,10 @@ public class AslExecutor {
         if (jsonata) {
             JsonNode statesVar = buildStatesVar(input, null, context);
             if (error != null && JsonataEvaluator.isExpression(error)) {
-                error = jsonataEvaluator.evaluate(error, statesVar, variables).asText();
+                error = jsonataEvaluator.evaluateField(error, "Error", statesVar, variables).asText();
             }
             if (cause != null && JsonataEvaluator.isExpression(cause)) {
-                cause = jsonataEvaluator.evaluate(cause, statesVar, variables).asText();
+                cause = jsonataEvaluator.evaluateField(cause, "Cause", statesVar, variables).asText();
             }
         }
         throw new FailStateException(error, cause);
@@ -2031,7 +2035,7 @@ public class AslExecutor {
             if (jsonata && value.isTextual() && JsonataEvaluator.isExpression(value.asText())) {
                 jsonataExpression = true;
                 JsonNode statesVar = buildStatesVar(mapInput, null, context);
-                value = jsonataEvaluator.evaluate(value.asText(), statesVar, variables);
+                value = jsonataEvaluator.evaluateField(value.asText(), "MaxConcurrency", statesVar, variables);
             }
         } else {
             return 0;
@@ -2118,19 +2122,8 @@ public class AslExecutor {
             // InputPath, which is supplied by executeMapState.
             JsonNode loc;
             if (jsonata && writer.has("Arguments")) {
-                JsonNode arguments = writer.get("Arguments");
-                loc = jsonataEvaluator.resolveTemplate(
-                        arguments, buildStatesVar(input, null, context), variables);
-                if (arguments.isObject()) {
-                    if (arguments.has("Bucket") && !loc.has("Bucket")) {
-                        throw new FailStateException("States.QueryEvaluationError",
-                                "ResultWriter Bucket must resolve to a string");
-                    }
-                    if (arguments.has("Prefix") && !loc.has("Prefix")) {
-                        throw new FailStateException("States.QueryEvaluationError",
-                                "ResultWriter Prefix must resolve to a string");
-                    }
-                }
+                loc = jsonataEvaluator.resolveTemplate(writer.get("Arguments"), "ResultWriter/Arguments",
+                        buildStatesVar(input, null, context), variables);
             } else if (writer.has("Parameters")) {
                 loc = resolveParameters(writer.get("Parameters"), input, context);
             } else {
@@ -2287,7 +2280,8 @@ public class AslExecutor {
             JsonNode itemsNode = stateDef.get("Items");
             if (itemsNode.isTextual() && JsonataEvaluator.isExpression(itemsNode.asText())) {
                 JsonNode statesVar = buildStatesVar(input, null, context);
-                return new ResolvedMapItems(jsonataEvaluator.evaluate(itemsNode.asText(), statesVar, variables),
+                return new ResolvedMapItems(
+                        jsonataEvaluator.evaluateField(itemsNode.asText(), "Items", statesVar, variables),
                         MapItemsSource.DEFAULT);
             }
             return new ResolvedMapItems(itemsNode, MapItemsSource.DEFAULT);
@@ -2323,7 +2317,8 @@ public class AslExecutor {
         JsonNode resolvedParameters;
         if (jsonata && itemReader.has("Arguments")) {
             JsonNode statesVar = buildStatesVar(input, null, context);
-            resolvedParameters = jsonataEvaluator.resolveTemplate(itemReader.get("Arguments"), statesVar, variables);
+            resolvedParameters = jsonataEvaluator.resolveTemplate(
+                    itemReader.get("Arguments"), "ItemReader/Arguments", statesVar, variables);
         } else {
             JsonNode parameters = itemReader.path("Parameters");
             resolvedParameters = resolveParameters(parameters, input, context);
@@ -2530,7 +2525,7 @@ public class AslExecutor {
                                                  ObjectNode variables) {
         JsonNode assigned = evaluateJsonataAssign(holder, statesVar, variables);
         JsonNode output = holder.has("Output")
-                ? jsonataEvaluator.resolveTemplate(holder.get("Output"), statesVar, variables)
+                ? jsonataEvaluator.resolveTemplate(holder.get("Output"), "Output", statesVar, variables)
                 : fallbackOutput;
         commitJsonataAssign(assigned, variables);
         return output;
@@ -2540,7 +2535,7 @@ public class AslExecutor {
         if (!holder.has("Assign")) {
             return null;
         }
-        JsonNode assigned = jsonataEvaluator.resolveTemplate(holder.get("Assign"), statesVar, variables);
+        JsonNode assigned = jsonataEvaluator.resolveTemplate(holder.get("Assign"), "Assign", statesVar, variables);
         if (assigned == null || !assigned.isObject()) {
             throw new FailStateException("States.Runtime", "Assign must evaluate to an object");
         }

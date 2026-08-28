@@ -288,7 +288,7 @@ class AslExecutorHttpInvokeTest {
     }
 
     @Test
-    void jsonataArgumentsSendAnExplicitNullAndOmitOnlyWhatReturnedNothing() throws Exception {
+    void jsonataArgumentsSendAnExplicitNull() throws Exception {
         // AWS keeps the null in the arguments a Task is invoked with: TestState TRACE reports
         // afterArguments {"FunctionName":"nope","Payload":{"v":null}} for Payload {"v":"{% null %}"}.
         Execution execution = run("""
@@ -307,7 +307,6 @@ class AslExecutorHttpInvokeTest {
                         },
                         "RequestBody": {
                           "fromInput": "{%% $lookup($states.input, 'customerId') %%}",
-                          "returnedNothing": "{%% $states.input.absent %%}",
                           "active": true
                         }
                       },
@@ -324,7 +323,6 @@ class AslExecutorHttpInvokeTest {
         assertEquals("SUCCEEDED", execution.getStatus(), execution.getCause());
         JsonNode body = objectMapper.readTree(onlyRequest().body());
         assertTrue(body.path("fromInput").isNull(), body.toString());
-        assertTrue(body.path("returnedNothing").isMissingNode(), body.toString());
         assertTrue(body.path("active").asBoolean());
     }
 
