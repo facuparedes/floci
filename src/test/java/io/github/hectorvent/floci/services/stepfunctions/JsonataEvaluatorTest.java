@@ -614,7 +614,9 @@ class JsonataEvaluatorTest {
         assertEquals("abc", evaluator.evaluate("{% $string('abc') %}", statesVar).asText());
         assertEquals("null", evaluator.evaluate("{% $string(null) %}", statesVar).asText());
         assertEquals("{\n  \"a\": 1\n}", evaluator.evaluate("{% $string({'a': 1}, true) %}", statesVar).asText());
-        assertTrue(evaluator.evaluate("{% $string() %}", statesVar).isNull());
+        // $string() with no argument returns nothing, which this change stops reporting as an
+        // explicit null. AWS fails the state on it, which is #2665's subject and not this one's.
+        assertTrue(evaluator.evaluate("{% $string() %}", statesVar).isMissingNode());
         assertEquals("[\"100000000000000000000\",\"1e+21\"]",
                 evaluator.evaluate("{% $map([1e20, 1e21], $string) %}", statesVar).toString());
     }
