@@ -64,7 +64,7 @@ class AslExecutorErrorTerminationTest {
         }
 
         @Override
-        JsonNode resolveTemplate(JsonNode template, JsonNode statesVar, JsonNode variables) {
+        JsonNode resolveTemplate(JsonNode template, String field, JsonNode statesVar, JsonNode variables) {
             throw new LinkageError(ERROR_MESSAGE);
         }
     }
