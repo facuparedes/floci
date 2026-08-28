@@ -66,6 +66,34 @@ uniformly between zero and the computed delay, as on AWS. One deviation. The del
 between attempts is capped at 30 seconds, the same cap Floci applies to `Wait` states,
 so emulated runs stay fast.
 
+## JSONata functions
+
+State machines with `"QueryLanguage": "JSONata"` reach the six functions Step Functions adds on
+top of the JSONata language, alongside every function JSONata itself provides.
+
+| Function | Returns |
+| --- | --- |
+| `$parse(jsonString)` | the deserialized value; the replacement for `$eval`, which AWS disables |
+| `$partition(array, chunkSize)` | `array` split into chunks of `chunkSize`, the last one holding the remainder |
+| `$range(start, end, step)` | the values from `start` to `end`, inclusive when `step` lands on `end` |
+| `$hash(str, algorithm)` | the hex digest of `str`; `algorithm` is `MD5`, `SHA-1`, `SHA-256`, `SHA-384` or `SHA-512`, case-sensitive |
+| `$random(seed)` | a number in `[0, 1)`, reproducible under the optional integer `seed` |
+| `$uuid()` | a v4 UUID |
+
+Three behaviours are worth knowing before reading an unexpected result, and all three are AWS's:
+
+- A non-integer argument is rounded **towards zero**, so `$range(-1.7, 2, 1)` starts at `-1` and
+  `$partition(items, 2.9)` chunks by 2.
+- Several arguments evaluate to undefined rather than failing: a chunk size of zero, an empty
+  array, a `$range` with no `step` or with a step whose sign disagrees with the direction, and a
+  `$hash` with no algorithm. An undefined value is then dropped from the surrounding `Output`
+  object, so the field goes missing instead of the state failing.
+- `$range` collapses a single-element range to the bare number, not a one-element array.
+
+One deviation. AWS bounds the memory an expression may use and fails a `$range` of roughly half a
+million elements with `Expression evaluation memory limit exceeded`; Floci has no such bound and
+builds the array.
+
 ## Mocked service integrations
 
 Floci supports the Step Functions Local mock configuration format

@@ -1,16 +1,33 @@
 package io.github.hectorvent.floci.services.stepfunctions;
 
+import com.dashjoin.jsonata.JException;
 import com.dashjoin.jsonata.Jsonata;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectReader;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.NullNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 
 import static io.github.hectorvent.floci.services.stepfunctions.AslExecutor.FailStateException;
 
@@ -28,11 +45,28 @@ import static com.dashjoin.jsonata.Jsonata.jsonata;
 @ApplicationScoped
 public class JsonataEvaluator {
 
+    private static final Set<String> HASH_ALGORITHMS = Set.of("MD5", "SHA-1", "SHA-256", "SHA-384", "SHA-512");
+
+    /**
+     * The largest magnitude a {@code double} can still hold as an exact integer count of longs.
+     * Past it AWS switches from an integer to exponent notation, and so does {@link #toJsonataValue}.
+     */
+    private static final double LARGEST_EXACT_LONG_AS_DOUBLE = 9.223372036854776E18;
+
     private final ObjectMapper objectMapper;
+    private final ObjectReader strictJsonReader;
+    private final Map<String, Jsonata.JFunction> stepFunctionsExtensions;
 
     @Inject
     public JsonataEvaluator(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
+        // AWS rejects what a lenient parser accepts: a second document after the first, a repeated
+        // key, an empty string. All three come back as D3137 there, so $parse reads through this
+        // reader rather than the shared mapper, whose settings belong to the wire protocol.
+        this.strictJsonReader = objectMapper.reader()
+                .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                .with(JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
+        this.stepFunctionsExtensions = buildStepFunctionsExtensions();
     }
 
     /**
@@ -71,6 +105,7 @@ public class JsonataEvaluator {
         try {
             Jsonata jsonataExpr = jsonata(expr);
             Jsonata.Frame frame = jsonataExpr.createFrame();
+            stepFunctionsExtensions.forEach(frame::bind);
             // Workflow variables (the Assign field) are referenced as top-level $name in AWS's
             // JSONata dialect, e.g. $CheckpointCount. They are bound alongside $states, never
             // inside it: AWS reserves $states for input/result/errorOutput/context only. $states is
@@ -159,5 +194,273 @@ public class JsonataEvaluator {
             return NullNode.getInstance();
         }
         return objectMapper.valueToTree(value);
+    }
+
+    /**
+     * The six JSONata functions the Step Functions dialect adds on top of the JSONata language,
+     * per https://docs.aws.amazon.com/step-functions/latest/dg/transforming-data.html. Five of
+     * them the dashjoin library does not have at all; $random it has with the wrong arity, so the
+     * binding shadows it to accept AWS's optional seed.
+     *
+     * <p>Each signature declares one optional slot more than the arity AWS documents. The library
+     * pads a short call with Java nulls up to the declared arity and refuses a call longer than
+     * it, so the extra slot is what lets an over-long call reach this code and fail with AWS's own
+     * message instead of the library's. A signature is also what makes the function usable as a
+     * value: dashjoin dereferences it unconditionally in $map, $filter, $sift, $each, $single and
+     * $reduce, and a null one throws a raw NullPointerException there.
+     */
+    private Map<String, Jsonata.JFunction> buildStepFunctionsExtensions() {
+        return Map.of(
+                "parse", new Jsonata.JFunction((input, arguments) -> parse(arguments), "<x?x?:x>"),
+                "partition", new Jsonata.JFunction((input, arguments) -> partition(arguments), "<x?x?x?:x>"),
+                "range", new Jsonata.JFunction((input, arguments) -> range(arguments), "<x?x?x?x?:x>"),
+                "hash", new Jsonata.JFunction((input, arguments) -> hash(arguments), "<x?x?x?:x>"),
+                "random", new Jsonata.JFunction((input, arguments) -> random(arguments), "<x?x?:x>"),
+                "uuid", new Jsonata.JFunction((input, arguments) -> uuid(arguments), "<x?:x>"));
+    }
+
+    /**
+     * The argument in a slot, or null when the caller left it out. A higher-order call such as
+     * {@code $map(items, $parse)} passes only the arguments it has, so the list can be shorter
+     * than the declared arity.
+     */
+    private static Object argument(List<Object> arguments, int index) {
+        return index < arguments.size() ? arguments.get(index) : null;
+    }
+
+    /**
+     * AWS refuses a call with more arguments than the function takes, naming the first surplus
+     * one. The signatures declare that slot so the surplus argument arrives here to be named.
+     */
+    private static void rejectSurplusArgument(List<Object> arguments, String functionName, int firstSurplusIndex) {
+        if (argument(arguments, firstSurplusIndex) != null) {
+            throw signatureError(functionName, firstSurplusIndex + 1);
+        }
+    }
+
+    private static JException signatureError(String functionName, int argumentNumber) {
+        return new JException("T0410: Argument " + argumentNumber + " of function \"" + functionName
+                + "\" does not match function signature", -1);
+    }
+
+    /**
+     * AWS rounds a non-integer argument towards zero, so -1.7 becomes -1 and 2.9 becomes 2, which
+     * is what a Java cast already does. Flooring instead shifts every negative argument by one.
+     */
+    private static long towardsZero(Object argument, String functionName, int argumentNumber) {
+        if (!(argument instanceof Number number)) {
+            throw signatureError(functionName, argumentNumber);
+        }
+        return (long) number.doubleValue();
+    }
+
+    /**
+     * $parse(jsonString): deserializes a JSON string, replacing AWS's disabled $eval. A missing
+     * argument evaluates to undefined (Java null); a non-string argument or JSON that AWS's
+     * parser refuses raises a JSONata error.
+     */
+    private Object parse(List<Object> arguments) {
+        rejectSurplusArgument(arguments, "parse", 1);
+        Object jsonArgument = argument(arguments, 0);
+        if (jsonArgument == null) {
+            return null;
+        }
+        if (!(jsonArgument instanceof String jsonString)) {
+            throw signatureError("parse", 1);
+        }
+        JsonNode parsed;
+        try {
+            parsed = strictJsonReader.readTree(jsonString);
+        } catch (JsonProcessingException e) {
+            throw new JException("D3137: Invalid JSON", -1);
+        }
+        // An empty or blank string parses to a missing node rather than raising. AWS calls it
+        // invalid JSON, and letting it through would turn an empty upstream body into "".
+        if (parsed == null || parsed.isMissingNode()) {
+            throw new JException("D3137: Invalid JSON", -1);
+        }
+        return toJsonataValue(parsed);
+    }
+
+    /**
+     * Converts a parsed JSON tree into plain Java values that JSONata can navigate as a path,
+     * using the JSONata null marker (not Java null, which JSONata reads as undefined) for JSON
+     * null so $exists() on a parsed null stays true, as it does on AWS.
+     */
+    private static Object toJsonataValue(JsonNode node) {
+        if (node.isNull()) {
+            return Jsonata.NULL_VALUE;
+        }
+        if (node.isObject()) {
+            Map<String, Object> map = new LinkedHashMap<>();
+            node.fields().forEachRemaining(entry -> map.put(entry.getKey(), toJsonataValue(entry.getValue())));
+            return map;
+        }
+        if (node.isArray()) {
+            List<Object> list = new ArrayList<>();
+            node.forEach(element -> list.add(toJsonataValue(element)));
+            return list;
+        }
+        if (node.isBoolean()) {
+            return node.booleanValue();
+        }
+        if (node.isNumber()) {
+            return toJsonataNumber(node);
+        }
+        return node.asText();
+    }
+
+    /**
+     * AWS keeps a JSON integer exact while it fits in a long and switches to a double past that,
+     * so 9223372036854775807 stays itself and 9223372036854775808 comes back as
+     * 9.223372036854776E18. It also drops a trailing zero, writing 1.0 as 1 and 1e2 as 100.
+     *
+     * <p>Reading every integer as a long regardless of width is what makes a number larger than a
+     * long come back negative.
+     */
+    private static Object toJsonataNumber(JsonNode node) {
+        if (node.isIntegralNumber() && node.canConvertToLong()) {
+            return node.longValue();
+        }
+        double value = node.doubleValue();
+        if (!Double.isFinite(value)) {
+            throw new JException("D3137: Invalid JSON", -1);
+        }
+        if (value == Math.rint(value) && Math.abs(value) < LARGEST_EXACT_LONG_AS_DOUBLE) {
+            return (long) value;
+        }
+        return value;
+    }
+
+    /**
+     * $partition(array, chunkSize): splits array into chunks of chunkSize elements, the last chunk
+     * holding the remainder. A missing chunk size returns the whole array as one chunk; a missing
+     * array, an empty array and a chunk size that rounds to zero evaluate to undefined (Java
+     * null); a chunk size that rounds below zero raises D3137, and a non-array first argument or a
+     * non-numeric chunk size raises a JSONata signature error. Rounding towards zero is what makes
+     * -0.5 undefined and -2 an error.
+     */
+    private static Object partition(List<Object> arguments) {
+        rejectSurplusArgument(arguments, "partition", 2);
+        Object arrayArgument = argument(arguments, 0);
+        if (arrayArgument == null) {
+            return null;
+        }
+        if (!(arrayArgument instanceof List<?> array)) {
+            throw new JException("T0412: Argument 1 of function \"partition\" must be an array of undefined", -1);
+        }
+        if (array.isEmpty()) {
+            return null;
+        }
+        Object chunkSizeArgument = argument(arguments, 1);
+        if (chunkSizeArgument == null) {
+            return List.of(array);
+        }
+        long chunkSize = towardsZero(chunkSizeArgument, "partition", 2);
+        if (chunkSize < 0) {
+            throw new JException("D3137: Second argument must be zero or greater", -1);
+        }
+        if (chunkSize == 0) {
+            return null;
+        }
+        List<Object> chunks = new ArrayList<>();
+        int size = (int) Math.min(chunkSize, array.size());
+        for (int i = 0; i < array.size(); i += size) {
+            chunks.add(new ArrayList<>(array.subList(i, Math.min(i + size, array.size()))));
+        }
+        return chunks;
+    }
+
+    /**
+     * $range(start, end, step): generates an array from start to end (inclusive, when the step
+     * lands on it). A single-element range collapses to the bare scalar, not a one-element array;
+     * a missing or zero step, or a step whose sign disagrees with the start/end direction,
+     * evaluates to undefined (Java null); a missing start or end raises a JSONata error.
+     */
+    private static Object range(List<Object> arguments) {
+        rejectSurplusArgument(arguments, "range", 3);
+        long start = towardsZero(argument(arguments, 0), "range", 1);
+        long end = towardsZero(argument(arguments, 1), "range", 2);
+        Object stepArgument = argument(arguments, 2);
+        if (stepArgument == null) {
+            return null;
+        }
+        long step = towardsZero(stepArgument, "range", 3);
+        if (step == 0 || (step > 0 && start > end) || (step < 0 && start < end)) {
+            return null;
+        }
+        if (start == end) {
+            return start;
+        }
+        // Counted in BigInteger, then iterated a fixed number of times. Walking the range with
+        // `v += step` and testing `v <= end` never terminates once the addition wraps: with a step
+        // near Long.MAX_VALUE the sum flips sign and lands back below the end on every pass.
+        BigInteger elements = BigInteger.valueOf(end)
+                .subtract(BigInteger.valueOf(start))
+                .divide(BigInteger.valueOf(step))
+                .add(BigInteger.ONE);
+        List<Object> values = new ArrayList<>();
+        long value = start;
+        for (BigInteger emitted = BigInteger.ZERO;
+                emitted.compareTo(elements) < 0;
+                emitted = emitted.add(BigInteger.ONE)) {
+            values.add(value);
+            value += step;
+        }
+        return values;
+    }
+
+    /**
+     * $hash(str, algorithm): hex-encoded digest of str using algorithm, one of MD5, SHA-1,
+     * SHA-256, SHA-384 or SHA-512 (case-sensitive). A missing or non-string str raises a JSONata
+     * signature error, a missing algorithm evaluates to undefined (Java null), and an algorithm
+     * name that is a string but not one of the five raises D3137: that is the split AWS makes
+     * between a wrong type and a wrong value.
+     */
+    private static Object hash(List<Object> arguments) {
+        rejectSurplusArgument(arguments, "hash", 2);
+        if (!(argument(arguments, 0) instanceof String value)) {
+            throw signatureError("hash", 1);
+        }
+        Object algorithmArgument = argument(arguments, 1);
+        if (algorithmArgument == null) {
+            return null;
+        }
+        if (!(algorithmArgument instanceof String algorithm)) {
+            throw signatureError("hash", 2);
+        }
+        if (!HASH_ALGORITHMS.contains(algorithm)) {
+            throw new JException("D3137: Hash algorithm '" + algorithm
+                    + "' must be one of SHA-1, SHA-384, SHA-256, SHA-512, MD5", -1);
+        }
+        try {
+            MessageDigest digest = MessageDigest.getInstance(algorithm);
+            return HexFormat.of().formatHex(digest.digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new JException("Hash algorithm '" + algorithm + "' is not available", -1);
+        }
+    }
+
+    /**
+     * $random(seed): a number in [0, 1). JSONata's own $random takes no arguments; the Step
+     * Functions one takes an optional integer seed and is reproducible under it. AWS draws from
+     * java.util.Random, so seeding one with the same value returns the same sequence: $random(42)
+     * is 0.7275636800328681 on both sides.
+     */
+    private static Object random(List<Object> arguments) {
+        rejectSurplusArgument(arguments, "random", 1);
+        Object seedArgument = argument(arguments, 0);
+        if (seedArgument == null) {
+            return ThreadLocalRandom.current().nextDouble();
+        }
+        return new Random(towardsZero(seedArgument, "random", 1)).nextDouble();
+    }
+
+    /**
+     * $uuid(): a random v4 UUID. Strictly zero-arity; any argument raises a JSONata error.
+     */
+    private static Object uuid(List<Object> arguments) {
+        rejectSurplusArgument(arguments, "uuid", 0);
+        return UUID.randomUUID().toString();
     }
 }

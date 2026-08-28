@@ -173,4 +173,380 @@ class JsonataEvaluatorTest {
         assertTrue(evaluator.resolveTemplate(objectMapper.readTree("true"), statesVar).asBoolean());
         assertTrue(evaluator.resolveTemplate(NullNode.getInstance(), statesVar).isNull());
     }
+
+    @Test
+    void parse_deserializesJsonObject() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $parse('{\"a\":1,\"b\":[1,2,3]}') %}", statesVar);
+        assertTrue(result.isObject());
+        assertEquals(1, result.get("a").asInt());
+        assertEquals(3, result.get("b").size());
+    }
+
+    @Test
+    void parse_navigatesFieldOffResult() throws Exception {
+        // The dominant real-world shape: $parse(x.Output).someField.
+        JsonNode statesVar = objectMapper.readTree("""
+                {"eligibilityRaw": {"Output": "{\\"joinable\\": true}"}}
+                """);
+        JsonNode result = evaluator.evaluate("{% $parse($states.eligibilityRaw.Output).joinable %}", statesVar);
+        assertTrue(result.asBoolean());
+    }
+
+    @Test
+    void parse_chainedWithArithmeticOnNestedField() throws Exception {
+        // Real acceptance shape: $round($parse($states.input[0].body).detail.amount.value * 100)
+        JsonNode statesVar = objectMapper.readTree("""
+                {"input": [{"body": "{\\"detail\\": {\\"amount\\": {\\"value\\": 12.345}}}"}]}
+                """);
+        JsonNode result = evaluator.evaluate(
+                "{% $round($parse($states.input[0].body).detail.amount.value * 100) %}", statesVar);
+        assertEquals(1234, result.asInt());
+    }
+
+    @Test
+    void parse_nullLiteralIsRealNullNotUndefined() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $exists($parse('null')) %}", statesVar);
+        assertTrue(result.asBoolean());
+    }
+
+    @Test
+    void parse_noArgumentReturnsUndefined() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $parse() %}", statesVar);
+        assertTrue(result.isNull());
+    }
+
+    @Test
+    void parse_nullArgumentRaisesSignatureError() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluate("{% $parse(null) %}", statesVar));
+        assertTrue(ex.cause.contains("T0410"));
+    }
+
+    @Test
+    void parse_invalidJsonRaisesError() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluate("{% $parse('not valid json') %}", statesVar));
+        assertTrue(ex.cause.contains("D3137"));
+    }
+
+    @Test
+    void partition_splitsIntoChunksWithShorterLastChunk() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $partition([1,2,3,4,5], 2) %}", statesVar);
+        assertEquals("[[1,2],[3,4],[5]]", result.toString());
+    }
+
+    @Test
+    void partition_missingChunkSizeReturnsWholeArrayAsOneChunk() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $partition([1,2,3]) %}", statesVar);
+        assertEquals("[[1,2,3]]", result.toString());
+    }
+
+    @Test
+    void partition_nonIntegerChunkSizeIsRoundedTowardsZero() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $partition([1,2,3,4,5], 2.9) %}", statesVar);
+        assertEquals("[[1,2],[3,4],[5]]", result.toString());
+    }
+
+    @Test
+    void partition_emptyArrayReturnsUndefined() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $partition([], 2) %}", statesVar);
+        assertTrue(result.isNull());
+    }
+
+    @Test
+    void partition_chunkSizeZeroReturnsUndefined() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $partition([1,2,3], 0) %}", statesVar);
+        assertTrue(result.isNull());
+    }
+
+    @Test
+    void partition_negativeChunkSizeRaisesError() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluate("{% $partition([1,2,3], -1) %}", statesVar));
+        assertTrue(ex.cause.contains("D3137: Second argument must be zero or greater"), ex.cause);
+    }
+
+    @Test
+    void partition_nullArrayRaisesError() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluate("{% $partition(null, 2) %}", statesVar));
+        assertTrue(ex.cause.contains("T0412"));
+    }
+
+    @Test
+    void range_generatesInclusiveAscendingArray() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $range(0, 10, 2) %}", statesVar);
+        assertEquals("[0,2,4,6,8,10]", result.toString());
+    }
+
+    @Test
+    void range_negativeStepGeneratesDescendingArray() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $range(10, 0, -2) %}", statesVar);
+        assertEquals("[10,8,6,4,2,0]", result.toString());
+    }
+
+    @Test
+    void range_nonIntegerStartIsRoundedTowardsZero() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $range(1.7, 5, 1) %}", statesVar);
+        assertEquals("[1,2,3,4,5]", result.toString());
+    }
+
+    @Test
+    void range_singleElementRangeCollapsesToScalar() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $range(3, 3, 1) %}", statesVar);
+        assertTrue(result.isNumber());
+        assertEquals(3, result.asInt());
+    }
+
+    @Test
+    void range_wrongSignStepReturnsUndefined() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $range(5, 1, 1) %}", statesVar);
+        assertTrue(result.isNull());
+    }
+
+    @Test
+    void range_stepZeroReturnsUndefined() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $range(1, 5, 0) %}", statesVar);
+        assertTrue(result.isNull());
+    }
+
+    @Test
+    void range_missingStepReturnsUndefined() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $range(1, 5) %}", statesVar);
+        assertTrue(result.isNull());
+    }
+
+    @Test
+    void range_missingEndRaisesSignatureError() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluate("{% $range(1) %}", statesVar));
+        assertTrue(ex.cause.contains("T0410"));
+    }
+
+    @Test
+    void hash_computesKnownDigestsForEachAlgorithm() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("8b1a9953c4611296a827abf8c47804d7",
+                evaluator.evaluate("{% $hash('Hello', 'MD5') %}", statesVar).asText());
+        assertEquals("f7ff9e8b7bb2e09b70935a5d785e0cc5d9d0abf0",
+                evaluator.evaluate("{% $hash('Hello', 'SHA-1') %}", statesVar).asText());
+        assertEquals("185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+                evaluator.evaluate("{% $hash('Hello', 'SHA-256') %}", statesVar).asText());
+    }
+
+    @Test
+    void hash_algorithmNameIsCaseSensitive() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluate("{% $hash('Hello', 'md5') %}", statesVar));
+        assertTrue(ex.cause.contains("D3137"));
+    }
+
+    @Test
+    void hash_unsupportedAlgorithmRaisesError() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluate("{% $hash('Hello', 'SHA3-256') %}", statesVar));
+        assertTrue(ex.cause.contains("D3137"));
+    }
+
+    @Test
+    void hash_missingAlgorithmReturnsUndefined() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $hash('Hello') %}", statesVar);
+        assertTrue(result.isNull());
+    }
+
+    @Test
+    void hash_nonStringValueRaisesSignatureError() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluate("{% $hash(42, 'MD5') %}", statesVar));
+        assertTrue(ex.cause.contains("T0410"));
+    }
+
+    @Test
+    void uuid_generatesCanonicalV4Uuid() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $uuid() %}", statesVar);
+        assertTrue(result.asText()
+                .matches("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"));
+    }
+
+    @Test
+    void uuid_successiveCallsAreDistinct() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $uuid() = $uuid() %}", statesVar);
+        assertFalse(result.asBoolean());
+    }
+
+    @Test
+    void uuid_anyArgumentRaisesSignatureError() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluate("{% $uuid('seed') %}", statesVar));
+        assertTrue(ex.cause.contains("T0410"));
+    }
+
+    @Test
+    void random_unseededCallsDiffer() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $random() = $random() %}", statesVar);
+        assertFalse(result.asBoolean());
+    }
+
+    @Test
+    void random_seedMakesTheDrawReproducible() {
+        // JSONata's own $random takes no arguments; the Step Functions one takes a seed and draws
+        // from java.util.Random, so these are the values AWS returns for the same seeds.
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals(0.7275636800328681, evaluator.evaluate("{% $random(42) %}", statesVar).asDouble());
+        assertEquals(0.730967787376657, evaluator.evaluate("{% $random(0) %}", statesVar).asDouble());
+        assertEquals(0.7306990420600421, evaluator.evaluate("{% $random(7) %}", statesVar).asDouble());
+    }
+
+    @Test
+    void random_seedRoundsTowardsZero() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals(evaluator.evaluate("{% $random(0) %}", statesVar).asDouble(),
+                evaluator.evaluate("{% $random(0.9) %}", statesVar).asDouble());
+    }
+
+    @Test
+    void random_surplusArgumentRaisesSignatureError() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluate("{% $random(1, 2) %}", statesVar));
+        assertTrue(ex.cause.contains("T0410"));
+    }
+
+    @Test
+    void roundingGoesTowardsZeroNotDownwards() {
+        // -1.7 becomes -1 on AWS, not -2. Flooring shifts every negative argument by one, which
+        // is a whole extra element at the head of the range.
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("[-1,0,1,2]", evaluator.evaluate("{% $range(-1.7, 2, 1) %}", statesVar).toString());
+        assertEquals("[-2,-1,0]", evaluator.evaluate("{% $range(-2.9, 0, 1) %}", statesVar).toString());
+        assertEquals("[5,4,3,2,1]", evaluator.evaluate("{% $range(5, 1, -1.5) %}", statesVar).toString());
+        // -0.5 rounds to 0, which is undefined, while -2 stays negative and is an error.
+        assertTrue(evaluator.evaluate("{% $partition([1,2,3,4], -0.5) %}", statesVar).isNull());
+    }
+
+    @Test
+    void range_stepNearLongMaxTerminates() {
+        // Walking with `v += step` and testing `v <= end` never terminates here: the addition
+        // wraps and lands back below the end on every pass.
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate(
+                "{% $count($range(-9223372036854775808, 9223372036854775807, 9223372036854775807)) %}", statesVar);
+        assertEquals(3, result.asInt());
+    }
+
+    @Test
+    void hash_computesTheRemainingAlgorithmsAndHashesUtf8Bytes() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("3519fe5ad2c596efe3e276a6f351b8fc0b03db861782490d45f7598ebd0ab5fd"
+                        + "5520ed102f38c4a5ec834e98668035fc",
+                evaluator.evaluate("{% $hash('Hello', 'SHA-384') %}", statesVar).asText());
+        assertEquals("3615f80c9d293ed7402687f94b22d58e529b8cc7916f8fac7fddf7fbd5af4cf7"
+                        + "77d3d795a7a00a16bf7e7f3fb9561ee9baae480da9fe7a18769e71886b03f315",
+                evaluator.evaluate("{% $hash('Hello', 'SHA-512') %}", statesVar).asText());
+        // A non-ASCII character is hashed as UTF-8, not as the platform charset.
+        assertEquals("94e9342ecbb1458b6043ecd3bfcbc192",
+                evaluator.evaluate("{% $hash('ñ', 'MD5') %}", statesVar).asText());
+    }
+
+    @Test
+    void hash_missingAlgorithmIsUndefinedButNonStringOneIsASignatureError() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertTrue(evaluator.evaluate("{% $hash('a') %}", statesVar).isNull());
+        AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluate("{% $hash('a', 5) %}", statesVar));
+        assertTrue(ex.cause.contains("T0410"));
+    }
+
+    @Test
+    void parse_keepsFieldOrder() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $parse('{\"b\":1,\"a\":2}') %}", statesVar);
+        assertEquals("{\"b\":1,\"a\":2}", result.toString());
+    }
+
+    @Test
+    void parse_keepsAnIntegerExactWhileItFitsInALong() {
+        // Reading every integer as a long regardless of width is what turns a number larger than
+        // a long negative. AWS switches to exponent notation at the same boundary.
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("9223372036854775807",
+                evaluator.evaluate("{% $parse('{\"n\":9223372036854775807}').n %}", statesVar).toString());
+        assertEquals(9.223372036854776E18,
+                evaluator.evaluate("{% $parse('{\"n\":9223372036854775808}').n %}", statesVar).asDouble());
+        assertEquals(1.2345678901234568E29,
+                evaluator.evaluate("{% $parse('123456789012345678901234567890') %}", statesVar).asDouble());
+    }
+
+    @Test
+    void parse_dropsATrailingZeroOnAnIntegerValuedNumber() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        assertEquals("1", evaluator.evaluate("{% $parse('1.0') %}", statesVar).toString());
+        assertEquals("100", evaluator.evaluate("{% $parse('1e2') %}", statesVar).toString());
+        assertEquals("1.5", evaluator.evaluate("{% $parse('1.5') %}", statesVar).toString());
+    }
+
+    @Test
+    void parse_rejectsJsonAwsRejects() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        // An empty body, a second document after the first, a repeated key and a number too large
+        // for a double are all D3137 on AWS. A lenient parser turns the first into "" and the
+        // second into a silent success on a truncated payload.
+        for (String json : new String[]{"''", "'  '", "'{\"a\":1}{\"b\":2}'", "'[1,2] [3,4]'",
+                "'{\"a\":1,\"a\":2}'", "'1e400'"}) {
+            AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                    () -> evaluator.evaluate("{% $parse(" + json + ") %}", statesVar),
+                    "expected $parse(" + json + ") to fail");
+            assertTrue(ex.cause.contains("D3137: Invalid JSON"),
+                    "wrong cause for $parse(" + json + "): " + ex.cause);
+        }
+    }
+
+    @Test
+    void surplusArgumentsRaiseASignatureError() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        for (String expression : new String[]{"$parse('{}', 'x')", "$partition([1,2,3], 2, 'x')",
+                "$range(1, 5, 1, 'x')", "$hash('a', 'MD5', 'x')"}) {
+            AslExecutor.FailStateException ex = assertThrows(AslExecutor.FailStateException.class,
+                    () -> evaluator.evaluate("{% " + expression + " %}", statesVar),
+                    "expected " + expression + " to fail");
+            assertTrue(ex.cause.contains("T0410"), "wrong code for " + expression + ": " + ex.cause);
+        }
+    }
+
+    @Test
+    void functionsAreUsableAsAValueInAHigherOrderCall() {
+        // dashjoin dereferences the signature of a bound function unconditionally in $map and
+        // friends, so a function bound without one throws a raw NullPointerException here.
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $map(['{\"a\":1}', '{\"a\":2}'], $parse).a %}", statesVar);
+        assertEquals("[1,2]", result.toString());
+    }
 }
