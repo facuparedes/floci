@@ -391,7 +391,16 @@ public class AslExecutor {
                         currentStateName = null;
                     }
                 } catch (FailStateException e) {
-                    StateResult caught = handleCatch(stateDef, currentInput, e, jsonata, execContext, variables);
+                    StateResult caught = null;
+                    FailStateException failure = e;
+                    try {
+                        caught = handleCatch(stateDef, currentInput, e, jsonata, execContext, variables);
+                    } catch (FailStateException catchClauseFailure) {
+                        // A matching Catch clause carries its own Assign and Output, and an
+                        // expression there can fail. AWS reports that failure, not the error the
+                        // clause was catching, and no later clause catches it.
+                        failure = catchClauseFailure;
+                    }
                     if (caught != null) {
                         addEvent(history, eventId, stateExitedEventType(type), eventId.get() - 1,
                                 Map.of("name", currentStateName, "output", caught.output().toString()));
@@ -399,7 +408,7 @@ public class AslExecutor {
                         currentStateName = caught.nextState();
                         continue;
                     }
-                    failExecution(exec, history, eventId, e);
+                    failExecution(exec, history, eventId, failure);
                     onUpdate.accept(exec, history);
                     return;
                 }
@@ -1660,7 +1669,8 @@ public class AslExecutor {
                     if (result.isBoolean() && result.asBoolean()) {
                         // A matched rule carries its own Assign and Output; the state-level ones
                         // belong to the Default path and do not run here.
-                        JsonNode output = applyJsonataAssignAndOutput(choice, statesVar, input, variables);
+                        JsonNode output = applyJsonataAssignAndOutput(
+                                choice, "Choices[" + i + "]/", statesVar, input, variables);
                         return new StateResult(output, choice.path("Next").asText());
                     }
                 }
@@ -1668,7 +1678,7 @@ public class AslExecutor {
             String defaultState = stateDef.path("Default").asText(null);
             if (defaultState != null) {
                 // No rule matched: the state-level Assign and Output apply on the Default path.
-                JsonNode output = applyJsonataAssignAndOutput(stateDef, statesVar, input, variables);
+                JsonNode output = applyJsonataAssignAndOutput(stateDef, "", statesVar, input, variables);
                 return new StateResult(output, defaultState);
             }
             throw new FailStateException("States.NoChoiceMatched", "No choice rule matched and no default state");
@@ -2514,28 +2524,35 @@ public class AslExecutor {
     private JsonNode applyJsonataOutput(JsonNode holder, JsonNode input, JsonNode result, JsonNode context,
                                         ObjectNode variables) {
         JsonNode statesVar = buildStatesVar(input, result, context);
-        return applyJsonataAssignAndOutput(holder, statesVar, result != null ? result : input, variables);
+        return applyJsonataAssignAndOutput(holder, "", statesVar, result != null ? result : input, variables);
     }
 
     /**
      * Apply the Assign and Output fields of anything that can carry them: a state, a Choice rule, or
-     * a Catch block. {@code fallbackOutput} is the value that becomes the output when Output is absent.
+     * a Catch clause. {@code fallbackOutput} is the value that becomes the output when Output is absent.
+     *
+     * <p>{@code holderPrefix} is what AWS puts before the holder's own field names in the cause of a
+     * States.QueryEvaluationError: empty for a state, {@code "Choices[1]/"} for the second Choice
+     * rule, {@code "Catch[1]/"} for the second Catch clause. AWS names a rule's own Output
+     * {@code Choices[1]/Output/v}, not {@code Output/v}.
      */
-    private JsonNode applyJsonataAssignAndOutput(JsonNode holder, JsonNode statesVar, JsonNode fallbackOutput,
-                                                 ObjectNode variables) {
-        JsonNode assigned = evaluateJsonataAssign(holder, statesVar, variables);
+    private JsonNode applyJsonataAssignAndOutput(JsonNode holder, String holderPrefix, JsonNode statesVar,
+                                                 JsonNode fallbackOutput, ObjectNode variables) {
+        JsonNode assigned = evaluateJsonataAssign(holder, holderPrefix, statesVar, variables);
         JsonNode output = holder.has("Output")
-                ? jsonataEvaluator.resolveTemplate(holder.get("Output"), "Output", statesVar, variables)
+                ? jsonataEvaluator.resolveTemplate(holder.get("Output"), holderPrefix + "Output", statesVar, variables)
                 : fallbackOutput;
         commitJsonataAssign(assigned, variables);
         return output;
     }
 
-    private JsonNode evaluateJsonataAssign(JsonNode holder, JsonNode statesVar, ObjectNode variables) {
+    private JsonNode evaluateJsonataAssign(JsonNode holder, String holderPrefix, JsonNode statesVar,
+                                           ObjectNode variables) {
         if (!holder.has("Assign")) {
             return null;
         }
-        JsonNode assigned = jsonataEvaluator.resolveTemplate(holder.get("Assign"), "Assign", statesVar, variables);
+        JsonNode assigned = jsonataEvaluator.resolveTemplate(
+                holder.get("Assign"), holderPrefix + "Assign", statesVar, variables);
         if (assigned == null || !assigned.isObject()) {
             throw new FailStateException("States.Runtime", "Assign must evaluate to an object");
         }
@@ -3380,7 +3397,8 @@ public class AslExecutor {
         }
         String error = failure.error != null ? failure.error : "States.Runtime";
         String cause = failure.cause != null ? failure.cause : "";
-        for (JsonNode catcher : catchers) {
+        for (int i = 0; i < catchers.size(); i++) {
+            JsonNode catcher = catchers.get(i);
             if (!catchMatches(catcher, error)) {
                 continue;
             }
@@ -3396,7 +3414,8 @@ public class AslExecutor {
                 // scope the catching state lives in — so for a Parallel or Map it lands in the outer
                 // scope, not the branch scope that failed.
                 JsonNode statesVar = buildCatchStatesVar(input, errorOutput, context);
-                JsonNode output = applyJsonataAssignAndOutput(catcher, statesVar, errorOutput, variables);
+                JsonNode output = applyJsonataAssignAndOutput(
+                        catcher, "Catch[" + i + "]/", statesVar, errorOutput, variables);
                 return new StateResult(output, next);
             }
             return new StateResult(mergeResult(catcher, input, errorOutput), next);

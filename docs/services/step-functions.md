@@ -100,8 +100,10 @@ that error fires:
 
 The field is named relative to the state, with `/` before each object key and `[i]` for each array
 index: `Output`, `Output/a/b[0]`, `Assign/x`, `Arguments/MessageGroupId`, `Choices[1]/Condition`,
-`Seconds`, `Error`, `Cause`, `Items`, `MaxConcurrency`. A `Choice` stops at the first rule that
-matches, so an undefined condition in a later rule is never evaluated.
+`Seconds`, `Error`, `Cause`, `Items`, `MaxConcurrency`. A matched `Choice` rule and a matching
+`Catch` clause carry their own `Assign` and `Output`, which are named under the rule or clause:
+`Choices[1]/Output/v`, `Choices[0]/Assign/x`, `Catch[1]/Output/v`. A `Choice` stops at the first rule
+that matches, so an undefined condition in a later rule is never evaluated.
 
 One deviation. AWS prefixes the cause of a real execution with
 `An error occurred while executing the state '<name>' (entered at the event id #<n>).`; Floci
