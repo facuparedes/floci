@@ -1487,22 +1487,28 @@ class StepFunctionsJsonataIntegrationTest {
     void aCatchClauseNamesItsOwnOutputUnderTheClauseIndex() throws Exception {
         // Real AWS names 'Catch[1]/Output/v': a clause's own Output is a field of the clause, and the
         // index is its position in Catch, not its position among the clauses that matched. Measured
-        // with a real execution, since TestState stops at CAUGHT_ERROR and never evaluates a Catch
-        // Output. The state below fails on its own Output first, which is the error being caught.
+        // with a real execution: TestState answers CAUGHT_ERROR and omits the output rather than
+        // failing. Catch belongs to a Task, which AWS rejects on a Pass, so the state below fails on
+        // its own Arguments and the clause catches that.
         String definition = """
                 {
                     "QueryLanguage": "JSONata",
                     "StartAt": "Boom",
                     "States": {
                         "Boom": {
-                            "Type": "Pass",
-                            "Output": {"first": "{% $states.input.missing %}"},
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::sqs:sendMessage",
+                            "Arguments": {
+                                "QueueUrl": "http://localhost:4566/000000000000/absent-queue",
+                                "MessageBody": "m",
+                                "MessageGroupId": "{% $states.input.missing %}"
+                            },
                             "Catch": [
                                 {"ErrorEquals": ["States.Timeout"], "Next": "Caught"},
                                 {"ErrorEquals": ["States.QueryEvaluationError"],
                                  "Output": {"v": "{% $states.input.missing %}"}, "Next": "Caught"}
                             ],
-                            "Next": "Caught"
+                            "End": true
                         },
                         "Caught": {"Type": "Pass", "End": true}
                     }
