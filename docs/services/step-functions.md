@@ -94,6 +94,33 @@ One deviation. AWS bounds the memory an expression may use and fails a `$range` 
 million elements with `Expression evaluation memory limit exceeded`; Floci has no such bound and
 builds the array.
 
+## JSONata expressions are validated when the state machine is created
+
+A JSONata expression runs with no context item: the execution input arrives as `$states.input`
+and a variable written by `Assign` as `$name`. A path that starts from neither reads a context
+item that does not exist, and AWS refuses the whole definition:
+
+```
+An error occurred (InvalidDefinition) when calling the CreateStateMachine operation:
+Invalid State Machine Definition: 'UNSUPPORTED_JSONATA_EXPRESSION: Reference to 'phone' at the
+top level is not supported. at /States/E/Output/v'
+```
+
+Floci refuses it too, from `CreateStateMachine`, `UpdateStateMachine` and
+`ValidateStateMachineDefinition`, with that message and that location. Write
+`$states.input.phone` to read the input and `$phone` to read a variable: an earlier `Assign` of
+`phone` does not put a bare `phone` in scope on AWS either.
+
+Only the first step of a path is read against the top-level context, so a name in a later step,
+in a predicate, in a sort term or in an object grouping stays legal and
+`$states.input.items[value > 3]` is accepted. A lambda body keeps the context of the expression
+that defines it, so `$map($states.input.a, function($x){ b })` does name `b` at the top level.
+
+Two neighbouring rules stay with the execution rather than the definition. A syntax error such as
+`{% a[1,2) %}` is accepted here and fails the execution, where AWS reports
+`INVALID_JSONATA_EXPRESSION` when the state machine is created; and `$$`, which AWS refuses under
+its own message, is accepted here.
+
 ## Mocked service integrations
 
 Floci supports the Step Functions Local mock configuration format
