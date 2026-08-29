@@ -80,7 +80,10 @@ The same `null` is a value inside the expression too: `$exists()` on it is true 
 is `"null"`. Only an expression that returns nothing loses its key, which is what
 `$states.input.absent` and the functions listed below that evaluate to undefined do.
 
-One deviation. `$count()` on a JSON null answers `0`; AWS answers `1`.
+Two deviations. `$count()` on a JSON null answers `0`; AWS answers `1`. And dropping the key of an
+expression that returned nothing is Floci's own behaviour: AWS fails the state instead, with
+`States.QueryEvaluationError` and `The JSONata expression '$states.input.absent' specified for the
+field 'Output/v' returned nothing (undefined).`
 
 ## JSONata functions
 
