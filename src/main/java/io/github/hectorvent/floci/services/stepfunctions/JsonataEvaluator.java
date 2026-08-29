@@ -62,6 +62,18 @@ public class JsonataEvaluator {
      */
     private static final double SMALLEST_EXPONENT_NOTATION = 1e21;
 
+    /** What dashjoin prefixes to an error whose code is not in its message catalog. */
+    private static final String UNKNOWN_CODE_PREFIX = "JSonataException ";
+
+    /** Stand-ins for the two values dashjoin substitutes; no catalog template contains them. */
+    private static final String CURRENT_MARKER = "{{floci-current}}";
+    private static final String EXPECTED_MARKER = "{{floci-expected}}";
+
+    /** The name jsonata-js gives each element type a function signature can ask an array for. */
+    private static final Map<Object, String> ARRAY_ELEMENT_TYPES = Map.of(
+            "a", "arrays", "b", "booleans", "f", "functions",
+            "n", "numbers", "o", "objects", "s", "strings");
+
     /**
      * How long one expression may evaluate before the state fails with
      * {@code States.QueryEvaluationError}. AWS bounds evaluation and Floci did not, so an
@@ -172,7 +184,68 @@ public class JsonataEvaluator {
             Object result = jsonataExpr.evaluate(null, frame);
             return toJsonNode(result);
         } catch (Exception e) {
-            throw new AslExecutor.FailStateException("States.QueryEvaluationError", e.getMessage());
+            throw new AslExecutor.FailStateException("States.QueryEvaluationError", queryEvaluationCause(e));
+        }
+    }
+
+    /**
+     * The cause AWS reports for a failed JSONata expression: the error code, then the message
+     * jsonata-js renders for it, as in {@code T0412: Argument 1 of function "sum" must be an array
+     * of "numbers"}. AWS puts a sentence naming the expression and the field in front of that,
+     * which needs the field path {@link #resolveTemplate} does not thread today (#2665).
+     *
+     * <p>The dashjoin port renders the message itself, and three things go wrong on the way. Its
+     * copy of the catalog has the word "function" replaced by "Object" throughout; its substituter
+     * fills the first two placeholders of a template and leaves a third one standing; and it quotes
+     * every value it inserts, where jsonata-js JSON-renders it. So the message is composed here
+     * from the code and the values {@link JException} carries instead.
+     */
+    private String queryEvaluationCause(Exception e) {
+        if (!(e instanceof JException jsonataError) || jsonataError.getError() == null) {
+            return e.getMessage();
+        }
+        String code = jsonataError.getError();
+        Object current = jsonataError.getCurrent();
+        Object expected = jsonataError.getExpected();
+        // Both this class's own functions and a few library call sites throw with the whole
+        // message in the code slot. The catalog lookup then misses and dashjoin prefixes its own
+        // class name, which AWS never emits; the message is the code slot itself.
+        if ((UNKNOWN_CODE_PREFIX + code).equals(jsonataError.getMessage())) {
+            return code;
+        }
+        return switch (code) {
+            // The only two templates in the catalog with a third placeholder. Neither third value
+            // reaches the exception: T0412 carries the offending argument and the element type it
+            // wanted but not the argument index nor the function name, and T2009 carries the two
+            // compared values but not the operator. Both sentences state what is carried.
+            case "T0412" -> "T0412: Argument " + json(current) + " must be an array of "
+                    + json(ARRAY_ELEMENT_TYPES.getOrDefault(expected, String.valueOf(expected)));
+            case "T2009" -> "T2009: The values " + json(current) + " and " + json(expected)
+                    + " either side of the operator must be of the same data type";
+            default -> code + ": " + renderTemplate(code, current, expected);
+        };
+    }
+
+    /**
+     * The catalog template for a code with its values substituted. Rendering it once with markers
+     * in the value slots is what keeps the template's own words apart from a value that happens to
+     * contain them, so restoring "function" cannot reach into a value. A marker comes back quoted
+     * where jsonata-js JSON-renders the value and bare where it inserts it raw.
+     */
+    private String renderTemplate(String code, Object current, Object expected) {
+        return JException.msg(code, -1, CURRENT_MARKER, EXPECTED_MARKER)
+                .replace("Object", "function")
+                .replace('"' + CURRENT_MARKER + '"', json(current))
+                .replace('"' + EXPECTED_MARKER + '"', json(expected))
+                .replace(CURRENT_MARKER, String.valueOf(current))
+                .replace(EXPECTED_MARKER, String.valueOf(expected));
+    }
+
+    private String json(Object value) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (JsonProcessingException e) {
+            return String.valueOf(value);
         }
     }
 
