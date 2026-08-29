@@ -79,10 +79,7 @@ an array element:
 The same `null` is a value inside the expression too: `$exists()` on it is true and `$type()` on it
 is `"null"`.
 
-Two deviations. `$count()` on a JSON null answers `0`; AWS answers `1`. And dropping the key of an
-expression that returned nothing is Floci's own behaviour: AWS fails the state instead, with
-`States.QueryEvaluationError` and `The JSONata expression '$states.input.absent' specified for the
-field 'Output/v' returned nothing (undefined).`
+One deviation. `$count()` on a JSON null answers `0`; AWS answers `1`.
 
 ## An expression that returns nothing fails the state
 
@@ -129,8 +126,8 @@ Three behaviours are worth knowing before reading an unexpected result, and all 
   `$partition(items, 2.9)` chunks by 2.
 - Several arguments evaluate to undefined rather than failing: a chunk size of zero, an empty
   array, a `$range` with no `step` or with a step whose sign disagrees with the direction, and a
-  `$hash` with no algorithm. An undefined value is then dropped from the surrounding `Output`
-  object, so the field goes missing instead of the state failing.
+  `$hash` with no algorithm. The argument itself does not fail; the field the expression was
+  written in does, under `States.QueryEvaluationError`, as the section above records.
 - `$range` collapses a single-element range to the bare number, not a one-element array.
 
 JSONata's own `$string` follows AWS's number notation: a whole number is written out in full below
