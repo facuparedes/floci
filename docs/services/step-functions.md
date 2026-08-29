@@ -66,6 +66,25 @@ uniformly between zero and the computed delay, as on AWS. One deviation. The del
 between attempts is capped at 30 seconds, the same cap Floci applies to `Wait` states,
 so emulated runs stay fast.
 
+## JSONata nulls
+
+An expression that evaluates to JSON `null` produces a value, not a missing one. It keeps its key
+in `Output`, in `Assign` and in a Task's `Arguments`, at any nesting depth, and it stays in place as
+an array element:
+
+```
+"Output": {"v": "{% $states.input.bar %}"}   on input {"bar": null}   ->   {"v": null}
+```
+
+The same `null` is a value inside the expression too: `$exists()` on it is true and `$type()` on it
+is `"null"`. Only an expression that returns nothing loses its key, which is what
+`$states.input.absent` and the functions listed below that evaluate to undefined do.
+
+Two deviations. `$count()` on a JSON null answers `0`; AWS answers `1`. And dropping the key of an
+expression that returned nothing is Floci's own behaviour: AWS fails the state instead, with
+`States.QueryEvaluationError` and `The JSONata expression '$states.input.absent' specified for the
+field 'Output/v' returned nothing (undefined).`
+
 ## JSONata functions
 
 State machines with `"QueryLanguage": "JSONata"` reach the six functions Step Functions adds on
@@ -104,6 +123,66 @@ One deviation. AWS also bounds the *memory* an expression may use, refusing
 `[1..900000] ~> $count()` with `Expression evaluation memory limit exceeded` while accepting the
 same expression at 800,000 elements. Floci bounds time and depth but not memory, and its ranges
 are lazy, so that expression answers immediately at any size.
+
+## Nested workflows
+
+A parent workflow calls a child workflow through one of several integrations, and they differ in
+more than syntax:
+
+| Resource | Child type | A child that fails | Result |
+| --- | --- | --- | --- |
+| `arn:aws:states:::states:startExecution` | Standard | not awaited | `{executionArn, startDate}` |
+| `arn:aws:states:::states:startExecution.sync` | Standard | fails the calling task | execution envelope, `output` as a JSON string |
+| `arn:aws:states:::states:startExecution.sync:2` | Standard | fails the calling task | the child output, parsed |
+| `arn:aws:states:::aws-sdk:sfn:startExecution` | Standard | not awaited | `{ExecutionArn, StartDate}` |
+| `arn:aws:states:::aws-sdk:sfn:startSyncExecution` | Express | reported through `Status` | PascalCase envelope, `Output` as a JSON string |
+
+`states:startExecution` and `aws-sdk:sfn:startExecution` are the same API through two different
+integrations, and only the casing of the result tells them apart.
+
+`startSyncExecution` is the only one that does not fail the calling task when the child fails: the
+SDK call itself succeeded, so the task result carries `Status`, `Error` and `Cause` and the parent
+decides what to do next.
+
+## AWS SDK task integrations
+
+A resource of the form `arn:aws:states:::aws-sdk:<service>:<action>` calls the service's API and
+returns its response. Two conventions separate that result from the same API's wire response, and
+both are AWS's:
+
+- **Field names are the SDK's**, so a `startDate` on the wire is a `StartDate` in the task result.
+- **A timestamp is an ISO-8601 string** such as `2026-08-28T20:34:59.712Z`, where the wire response
+  carries epoch seconds.
+
+A failure names the SDK exception class, which always ends in `Exception`:
+`StartExecution` answers a missing state machine with the error code `StateMachineDoesNotExist` on
+the wire and the task fails with `Sfn.StateMachineDoesNotExistException`.
+
+| Resource | Result | Notable failure |
+| --- | --- | --- |
+| `arn:aws:states:::aws-sdk:sfn:startExecution` | `{ExecutionArn, StartDate}` | `Sfn.ExecutionAlreadyExistsException` when `Name` is reused |
+| `arn:aws:states:::aws-sdk:sfn:startSyncExecution` | execution envelope | `Sfn.StateMachineTypeNotSupportedException` for a Standard child |
+| `arn:aws:states:::aws-sdk:sfn:sendTaskSuccess` | `{}` | `Sfn.InvalidTokenException` when no task is waiting on the token |
+| `arn:aws:states:::aws-sdk:sfn:sendTaskFailure` | `{}` | `Sfn.InvalidTokenException` |
+| `arn:aws:states:::aws-sdk:scheduler:createSchedule` | `{ScheduleArn}` | `Scheduler.ConflictException` when the name is taken |
+| `arn:aws:states:::aws-sdk:scheduler:updateSchedule` | `{ScheduleArn}` | `Scheduler.ResourceNotFoundException` |
+
+`sendTaskSuccess` and `sendTaskFailure` resolve a token a `.waitForTaskToken` task is parked on. A
+token nobody is waiting for fails the calling task rather than reporting a delivery that never
+happened.
+
+## Publishing events
+
+`arn:aws:states:::events:putEvents` returns the PutEvents response itself, `Entries` and
+`FailedEntryCount`, and one rejected entry fails the whole task with `EventBridge.FailedEntry`. The
+cause is the response serialized as a string, so a `Catch` can read which entry was rejected:
+
+```json
+{"FailedEntryCount":1,"Entries":[{"EventId":"08cbdc46-…"},{"ErrorCode":"InvalidArgument","ErrorMessage":"EventBus not found: no-such-bus"}]}
+```
+
+One deviation, and it belongs to EventBridge rather than to the integration: Floci rejects an entry
+addressed to an event bus that does not exist, while AWS accepts it and returns an `EventId`.
 
 ## JSONata expressions are validated when the state machine is created
 
