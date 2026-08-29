@@ -57,13 +57,19 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     private static final Set<String> JSONPATH_ONLY_FIELDS = Set.of(
             "InputPath", "OutputPath", "ResultPath", "ResultSelector", "Parameters", "Result", "ItemsPath",
             "MaxConcurrencyPath");
-    // A {% %} string in one of these is not an expression on AWS: Comment, Next, Default and
-    // Resource keep it as text, ErrorEquals and Retry hold error names and integers, and the
-    // JSONata support of Credentials.RoleArn is hidden behind an ARN check that fires first.
-    // ItemProcessor, Iterator and Branches carry nested states, walked as states of their own.
-    private static final Set<String> FIELDS_AWS_DOES_NOT_PARSE_AS_JSONATA = Set.of(
+    // A {% %} string in one of these ASL fields is not an expression on AWS: Comment, Next,
+    // Default and Resource keep it as text, ErrorEquals and Retry hold error names and integers,
+    // ReaderConfig.CSVHeaders holds literal column names, and the JSONata support of
+    // Credentials.RoleArn is hidden behind an ARN check that fires first. ItemProcessor, Iterator
+    // and Branches carry nested states, walked as states of their own.
+    private static final Set<String> ASL_FIELDS_AWS_DOES_NOT_PARSE_AS_JSONATA = Set.of(
             "Comment", "Next", "Default", "Resource", "ErrorEquals", "Retry", "Credentials",
-            "ItemProcessor", "Iterator", "Branches");
+            "ItemProcessor", "Iterator", "Branches", "CSVHeaders");
+    // The fields whose value is a user payload rather than ASL. AWS parses every string inside
+    // one, at any depth, so a payload key that happens to be named Next or Comment is an
+    // expression there and the deny list above stops applying once the walk enters one.
+    private static final Set<String> JSONATA_PAYLOAD_FIELDS = Set.of(
+            "Output", "Assign", "Arguments", "ItemSelector", "BatchInput");
     private static final Set<String> ITEM_READER_RESOURCES = Set.of(
             "arn:aws:states:::s3:getObject",
             "arn:aws:states:::s3:listObjectsV2");
@@ -1483,22 +1489,35 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
      * Reports every JSONata expression in the state that reads the top-level context, which real
      * AWS refuses at CreateStateMachine time. Only the fields AWS parses as JSONata are walked:
      * measured against {@code validate-state-machine-definition}, a {@code {% %}} string in
-     * Comment, Next, Default, Resource, ErrorEquals, Retry or Credentials is left alone, while
-     * Output, Assign, Arguments, Items, Seconds, Condition, ItemBatcher, ItemReader, ItemSelector,
-     * ResultWriter and the rest are parsed and reported.
+     * Comment, Next, Default, Resource, ErrorEquals, Retry, Credentials or ReaderConfig.CSVHeaders
+     * is left alone, while Output, Assign, Arguments, Items, Seconds, Condition, ItemBatcher,
+     * ItemReader, ItemSelector, ResultWriter and the rest are parsed and reported.
+     *
+     * <p>Those names are ASL fields, not payload keys. AWS parses a payload whole, so
+     * {@code Assign: {"Next": "{% phone %}"}} and {@code Arguments: {"Payload": {"Comment":
+     * "{% phone %}"}}} are both refused by name, and the deny list stops applying as soon as the
+     * walk enters one of {@link #JSONATA_PAYLOAD_FIELDS}.
      */
     private static void collectTopLevelReferences(String path, JsonNode node, List<String> errors) {
+        collectTopLevelReferences(path, node, false, errors);
+    }
+
+    private static void collectTopLevelReferences(String path, JsonNode node, boolean insidePayload,
+                                                  List<String> errors) {
         if (node.isObject()) {
             node.fields().forEachRemaining(field -> {
-                if (!FIELDS_AWS_DOES_NOT_PARSE_AS_JSONATA.contains(field.getKey())) {
-                    collectTopLevelReferences(path + "/" + field.getKey(), field.getValue(), errors);
+                String name = field.getKey();
+                if (insidePayload || !ASL_FIELDS_AWS_DOES_NOT_PARSE_AS_JSONATA.contains(name)) {
+                    collectTopLevelReferences(path + "/" + name, field.getValue(),
+                            insidePayload || JSONATA_PAYLOAD_FIELDS.contains(name), errors);
                 }
             });
             return;
         }
         if (node.isArray()) {
             for (int index = 0; index < node.size(); index++) {
-                collectTopLevelReferences(path + "[" + index + "]", node.get(index), errors);
+                collectTopLevelReferences(path + "[" + index + "]", node.get(index), insidePayload,
+                        errors);
             }
             return;
         }

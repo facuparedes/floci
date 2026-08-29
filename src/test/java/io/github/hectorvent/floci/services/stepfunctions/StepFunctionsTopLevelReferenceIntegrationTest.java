@@ -252,6 +252,58 @@ class StepFunctionsTopLevelReferenceIntegrationTest {
     }
 
     @Test
+    @DisplayName("ReaderConfig.CSVHeaders holds column names, not expressions, as AWS does")
+    void readerConfigCsvHeadersAreNotParsed() {
+        expectAccepted("""
+                {"QueryLanguage":"JSONata","StartAt":"M","States":{
+                  "M":{"Type":"Map",
+                       "ItemReader":{"Resource":"arn:aws:states:::s3:getObject",
+                                     "Arguments":{"Bucket":"b","Key":"k"},
+                                     "ReaderConfig":{"InputType":"CSV","CSVHeaderLocation":"GIVEN",
+                                                     "CSVHeaders":["{% phone %}"]}},
+                       "ItemProcessor":{"StartAt":"I","States":{"I":{"Type":"Pass","End":true}}},
+                       "End":true}}}
+                """);
+    }
+
+    @Test
+    @DisplayName("a payload key named after an ASL field is still an expression, as AWS parses it")
+    void aPayloadKeyNamedAfterAnAslFieldIsParsed() {
+        expectTopLevelReference("""
+                {"QueryLanguage":"JSONata","StartAt":"E",
+                 "States":{"E":{"Type":"Pass","Assign":{"Next":"{% phone %}"},"End":true}}}
+                """, "phone", "/States/E/Assign/Next");
+        expectTopLevelReference("""
+                {"QueryLanguage":"JSONata","StartAt":"E","States":{
+                  "E":{"Type":"Task","Resource":"arn:aws:states:::lambda:invoke",
+                       "Arguments":{"FunctionName":"f","Payload":{"Comment":"{% phone %}"}},
+                       "End":true}}}
+                """, "phone", "/States/E/Arguments/Payload/Comment");
+        expectTopLevelReference(passWithOutput("{\"ItemProcessor\":{\"Iterator\":\"{% phone %}\"}}"),
+                "phone", "/States/E/Output/ItemProcessor/Iterator");
+        expectTopLevelReference("""
+                {"QueryLanguage":"JSONata","StartAt":"M","States":{
+                  "M":{"Type":"Map","ItemSelector":{"Next":"{% phone %}"},
+                       "ItemProcessor":{"StartAt":"I","States":{"I":{"Type":"Pass","End":true}}},
+                       "End":true}}}
+                """, "phone", "/States/M/ItemSelector/Next");
+        expectTopLevelReference("""
+                {"QueryLanguage":"JSONata","StartAt":"M","States":{
+                  "M":{"Type":"Map","ItemBatcher":{"BatchInput":{"Comment":"{% phone %}"}},
+                       "ItemProcessor":{"StartAt":"I","States":{"I":{"Type":"Pass","End":true}}},
+                       "End":true}}}
+                """, "phone", "/States/M/ItemBatcher/BatchInput/Comment");
+        expectTopLevelReference("""
+                {"QueryLanguage":"JSONata","StartAt":"E","States":{
+                  "E":{"Type":"Task","Resource":"arn:aws:states:::lambda:invoke",
+                       "Arguments":{"FunctionName":"f"},
+                       "Catch":[{"ErrorEquals":["States.ALL"],"Assign":{"Retry":"{% phone %}"},
+                                 "Next":"D"}],"End":true},
+                  "D":{"Type":"Pass","End":true}}}
+                """, "phone", "/States/E/Catch[0]/Assign/Retry");
+    }
+
+    @Test
     @DisplayName("a syntax error is left to the execution, as it is today")
     void syntaxErrorsAreOutOfScope() {
         expectAccepted(passWithOutput("{\"v\":\"{% phone[1,2) %}\"}"));
