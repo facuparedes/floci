@@ -78,13 +78,34 @@ an array element:
 ```
 
 The same `null` is a value inside the expression too: `$exists()` on it is true and `$type()` on it
-is `"null"`. Only an expression that returns nothing loses its key, which is what
-`$states.input.absent` and the functions listed below that evaluate to undefined do.
+is `"null"`.
 
-Two deviations. `$count()` on a JSON null answers `0`; AWS answers `1`. And dropping the key of an
-expression that returned nothing is Floci's own behaviour: AWS fails the state instead, with
-`States.QueryEvaluationError` and `The JSONata expression '$states.input.absent' specified for the
-field 'Output/v' returned nothing (undefined).`
+One deviation. `$count()` on a JSON null answers `0`; AWS answers `1`.
+
+## An expression that returns nothing fails the state
+
+An expression that returns nothing, which is what `$states.input.absent` and the functions listed
+below that evaluate to undefined do, is not a missing value the state carries on without. It fails
+the state with `States.QueryEvaluationError`, naming the field it was written in, and a `Catch` on
+that error fires:
+
+```
+"Output": {"v": "{% $states.input.absent %}"}
+  ->  States.QueryEvaluationError
+      The JSONata expression '$states.input.absent' specified for the field 'Output/v'
+      returned nothing (undefined).
+```
+
+The field is named relative to the state, with `/` before each object key and `[i]` for each array
+index: `Output`, `Output/a/b[0]`, `Assign/x`, `Arguments/MessageGroupId`, `Choices[1]/Condition`,
+`Seconds`, `Error`, `Cause`, `Items`, `MaxConcurrency`. A matched `Choice` rule and a matching
+`Catch` clause carry their own `Assign` and `Output`, which are named under the rule or clause:
+`Choices[1]/Output/v`, `Choices[0]/Assign/x`, `Catch[1]/Output/v`. A `Choice` stops at the first rule
+that matches, so an undefined condition in a later rule is never evaluated.
+
+One deviation. AWS prefixes the cause of a real execution with
+`An error occurred while executing the state '<name>' (entered at the event id #<n>).`; Floci
+returns the cause without it, which is the form AWS's own `TestState` returns.
 
 ## JSONata functions
 
@@ -106,8 +127,8 @@ Three behaviours are worth knowing before reading an unexpected result, and all 
   `$partition(items, 2.9)` chunks by 2.
 - Several arguments evaluate to undefined rather than failing: a chunk size of zero, an empty
   array, a `$range` with no `step` or with a step whose sign disagrees with the direction, and a
-  `$hash` with no algorithm. An undefined value is then dropped from the surrounding `Output`
-  object, so the field goes missing instead of the state failing.
+  `$hash` with no algorithm. The argument itself does not fail; the field the expression was
+  written in does, under `States.QueryEvaluationError`, as the section above records.
 - `$range` collapses a single-element range to the bare number, not a one-element array.
 
 JSONata's own `$string` follows AWS's number notation: a whole number is written out in full below

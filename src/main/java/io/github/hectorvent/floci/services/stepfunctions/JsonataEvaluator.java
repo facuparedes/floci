@@ -256,33 +256,46 @@ public class JsonataEvaluator {
     }
 
     /**
-     * Walk a JSON template (Arguments or Output), evaluating any {% %} strings found.
+     * Evaluate the single expression an ASL field holds, failing the state when it returns nothing.
+     * AWS names the field in the cause and a {@code Catch} on States.QueryEvaluationError fires:
+     * a Wait whose Seconds returned nothing does not wait zero seconds, it fails.
+     *
+     * <p>{@code field} is the field's path relative to the state, as AWS writes it: {@code Seconds},
+     * {@code Choices[1]/Condition}, {@code Output/a/b}.
+     */
+    JsonNode evaluateField(String expression, String field, JsonNode statesVar, JsonNode variables) {
+        JsonNode value = evaluate(expression, statesVar, variables);
+        if (value.isMissingNode()) {
+            throw new FailStateException("States.QueryEvaluationError",
+                    "The JSONata expression '" + (isExpression(expression) ? unwrap(expression) : expression)
+                            + "' specified for the field '" + field + "' returned nothing (undefined).");
+        }
+        return value;
+    }
+
+    /**
+     * Walk a JSON template (Arguments, Output or Assign), evaluating any {% %} strings found.
      * Non-expression values pass through unchanged.
      *
      * Only pure {% expression %} strings are evaluated (can return any JSON type).
      * All other strings pass through unchanged.
+     *
+     * <p>{@code field} is the template's own field name, which the walk extends with {@code /key}
+     * per object key and {@code [i]} per array index so a failing expression is named the way AWS
+     * names it: {@code Output/a/b[0][1]}.
      */
-    JsonNode resolveTemplate(JsonNode template, JsonNode statesVar) {
-        return resolveTemplate(template, statesVar, null);
+    JsonNode resolveTemplate(JsonNode template, String field, JsonNode statesVar) {
+        return resolveTemplate(template, field, statesVar, null);
     }
 
-    JsonNode resolveTemplate(JsonNode template, JsonNode statesVar, JsonNode variables) {
+    JsonNode resolveTemplate(JsonNode template, String field, JsonNode statesVar, JsonNode variables) {
         if (template == null || template.isMissingNode()) {
             return template;
         }
-        JsonNode resolved = resolveTemplateNode(template, statesVar, variables);
-        // A resolved Output or Arguments is serialized as it stands, and a missing node writes
-        // itself as the empty string, which no client can parse. "Returned nothing" is a value only
-        // in the positions resolveTemplateNode reads it in: an object field it drops, an array
-        // element it fails the state on. As the whole field there is nothing to drop it from.
-        return resolved.isMissingNode() ? NullNode.getInstance() : resolved;
-    }
-
-    private JsonNode resolveTemplateNode(JsonNode template, JsonNode statesVar, JsonNode variables) {
         if (template.isTextual()) {
             String text = template.asText();
             if (isExpression(text)) {
-                return evaluate(text, statesVar, variables);
+                return evaluateField(text, field, statesVar, variables);
             }
             return template;
         }
@@ -291,30 +304,15 @@ public class JsonataEvaluator {
             Iterator<Map.Entry<String, JsonNode>> fields = template.fields();
             while (fields.hasNext()) {
                 Map.Entry<String, JsonNode> entry = fields.next();
-                JsonNode value = resolveTemplateNode(entry.getValue(), statesVar, variables);
-                // Per JSONata spec: an expression that returned nothing is omitted from object
-                // output, matching real AWS Step Functions behavior. A JSON null is a value and
-                // keeps its key: AWS answers {"v":null} to Output {"v":"{% null %}"}.
-                if (!value.isMissingNode()) {
-                    resolved.set(entry.getKey(), value);
-                }
+                resolved.set(entry.getKey(),
+                        resolveTemplate(entry.getValue(), field + "/" + entry.getKey(), statesVar, variables));
             }
             return resolved;
         }
         if (template.isArray()) {
             ArrayNode resolved = objectMapper.createArrayNode();
             for (int i = 0; i < template.size(); i++) {
-                JsonNode element = template.get(i);
-                JsonNode value = resolveTemplateNode(element, statesVar, variables);
-                // Per real AWS behavior: an array element that returned nothing fails the execution.
-                // Unlike object fields (which are omitted), undefined in an array is a runtime error.
-                // A JSON null is a value and stays: AWS answers [null,1] to ["{% null %}",1].
-                if (value.isMissingNode()) {
-                    String expr = element.isTextual() ? element.asText() : element.toString();
-                    throw new FailStateException("States.Runtime",
-                            "The JSONata expression '" + expr + "' at array index " + i + " returned nothing (undefined).");
-                }
-                resolved.add(value);
+                resolved.add(resolveTemplate(template.get(i), field + "[" + i + "]", statesVar, variables));
             }
             return resolved;
         }
@@ -336,9 +334,9 @@ public class JsonataEvaluator {
 
     /**
      * The evaluation result. A Java null is the expression returning nothing, which
-     * {@link #resolveTemplateNode} drops from an object; the JSONata null marker is a JSON null,
-     * which it keeps. Nested inside an object or an array there is no undefined, so every null
-     * there is a JSON null.
+     * {@link #evaluateField} fails the state on; the JSONata null marker is a JSON null, which is a
+     * value like any other. Nested inside an object or an array there is no undefined, so every
+     * null there is a JSON null.
      */
     private JsonNode toJsonNode(Object value) {
         return value == null ? MissingNode.getInstance() : fromJsonataValue(value);
