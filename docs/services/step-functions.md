@@ -195,7 +195,10 @@ Evaluation is bounded on three axes, as it is on AWS, and past any of them the s
   element more, and it accepts a string doubled 22 times, 2^22 characters, refusing the 23rd. The
   refusal is AWS's own
   `Expression evaluation memory limit exceeded`, which is what `[1..900000] ~> $count()` and
-  `$sum([1..900000])` now answer.
+  `$sum([1..900000])` now answer. `$range` holds a tighter bound of its own, checked before it
+  allocates rather than on the array it would have built: AWS accepts `$range(1, 360145, 1)`, all
+  360,145 elements, and refuses one element more with the same refusal. A lazy literal range such
+  as `[1..873782]` is exempt from both bounds on AWS, and stays exempt here.
 - **Time**: five seconds, which is the library's own default and roughly fifty times the slowest
   evaluation of a payload AWS itself accepts. A recursive expression with no base case is a tail
   call, so it loops rather than nesting and only the clock ends it.

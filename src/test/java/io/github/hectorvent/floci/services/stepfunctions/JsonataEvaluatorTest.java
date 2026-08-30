@@ -350,6 +350,50 @@ class JsonataEvaluatorTest {
         assertTrue(ex.cause.contains("T0410"));
     }
 
+    /**
+     * The AWS bound on how many elements a single {@code $range} call may produce, measured
+     * directly (us-east-1, test-state, 2026-08-30): AWS accepts {@code $range(1, 360145, 1)},
+     * returning all 360,145 elements.
+     */
+    @Test
+    void rangeAtTheAwsElementBoundBuildsTheFullArray() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        JsonNode result = evaluator.evaluate("{% $count($range(1, 360145, 1)) %}", statesVar);
+        assertEquals(360145, result.asInt());
+    }
+
+    /**
+     * One element past the bound, AWS fails the state with {@code States.QueryEvaluationError}
+     * and this cause byte for byte (us-east-1, test-state, 2026-08-30).
+     */
+    @Test
+    void rangeOneElementPastTheAwsElementBoundFailsWithTheMemoryRefusal() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        AslExecutor.FailStateException failure = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluateField("{% $range(1, 360146, 1) %}", "Output/v", statesVar, null));
+        assertEquals("States.QueryEvaluationError", failure.error);
+        assertEquals("The JSONata expression '$range(1, 360146, 1)' specified for the field 'Output/v' threw "
+                + "an error during evaluation: Expression evaluation memory limit exceeded: Check for excessive "
+                + "memory usage", failure.cause);
+    }
+
+    /**
+     * Far past the bound, the refusal has to come from the pre-allocation cap in {@code range()}
+     * rather than from the memory bound on the built value: an unbounded call would spend
+     * gigabytes building the array before that check ever runs.
+     */
+    @Test
+    @Timeout(60)
+    void rangeFarPastTheBoundFailsWithoutAllocating() {
+        JsonNode statesVar = objectMapper.createObjectNode();
+        AslExecutor.FailStateException failure = assertThrows(AslExecutor.FailStateException.class,
+                () -> evaluator.evaluateField("{% $range(1, 1000000000, 1) %}", "Output/v", statesVar, null));
+        assertEquals("States.QueryEvaluationError", failure.error);
+        assertEquals("The JSONata expression '$range(1, 1000000000, 1)' specified for the field 'Output/v' threw "
+                + "an error during evaluation: Expression evaluation memory limit exceeded: Check for excessive "
+                + "memory usage", failure.cause);
+    }
+
     @Test
     void hash_computesKnownDigestsForEachAlgorithm() {
         JsonNode statesVar = objectMapper.createObjectNode();

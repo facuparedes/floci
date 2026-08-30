@@ -122,6 +122,27 @@ public class JsonataEvaluator {
      */
     static final long MAX_EXPRESSION_BYTES = 873_782L * BYTES_PER_SCALAR;
 
+    /**
+     * The largest number of elements a single {@code $range} call may produce before floci
+     * refuses it, the bound AWS itself holds specifically for {@code $range}: AWS accepts
+     * {@code $range(1, 360145, 1)}, returning all 360,145 elements, and refuses one element more
+     * with the same memory refusal as {@link #MAX_EXPRESSION_BYTES}. That general bound is looser
+     * (873,782 scalars) and is checked only on the value an evaluation step has already built; a
+     * lazy literal range such as {@code [1..873782]} is exempt from it on AWS, and stays exempt
+     * here. {@code $range} gets a bound of its own because it is the one construct that actually
+     * allocates a list of that size, so the general check would see the memory only after the
+     * allocation already happened.
+     */
+    static final int MAX_RANGE_ELEMENTS = 360_145;
+
+    /**
+     * AWS's own sentence for an expression that exceeded its evaluation memory limit, shared by
+     * the bound on a built value ({@link #boundHeldMemory}) and the pre-allocation cap on
+     * {@code $range} ({@link #range}).
+     */
+    private static final String MEMORY_LIMIT_EXCEEDED =
+            "Expression evaluation memory limit exceeded: Check for excessive memory usage";
+
     private final ObjectMapper objectMapper;
     private final ObjectReader strictJsonReader;
     private final Map<String, Jsonata.JFunction> stepFunctionsExtensions;
@@ -289,8 +310,7 @@ public class JsonataEvaluator {
     private static void boundHeldMemory(Jsonata.Frame frame) {
         afterEachEvaluationStep(frame, (expression, input, environment, result) -> {
             if (heldBytes(result, 0) > MAX_EXPRESSION_BYTES) {
-                throw new JException(
-                        "Expression evaluation memory limit exceeded: Check for excessive memory usage", -1);
+                throw new JException(MEMORY_LIMIT_EXCEEDED, -1);
             }
         });
     }
@@ -851,6 +871,9 @@ public class JsonataEvaluator {
                 .subtract(BigInteger.valueOf(start))
                 .divide(BigInteger.valueOf(step))
                 .add(BigInteger.ONE);
+        if (elements.compareTo(BigInteger.valueOf(MAX_RANGE_ELEMENTS)) > 0) {
+            throw new JException(MEMORY_LIMIT_EXCEEDED, -1);
+        }
         List<Object> values = new ArrayList<>();
         long value = start;
         for (BigInteger emitted = BigInteger.ZERO;
