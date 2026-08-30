@@ -1310,14 +1310,17 @@ class StepFunctionsJsonataIntegrationTest {
      * <p>The branch expression is the issue's own reproduction verbatim (quotes swapped to
      * JSONata's single-quote string literal, which embeds in this JSON body without escaping):
      * a tail-recursive function doubles a string 31 times, which dashjoin loops rather than
-     * recursing on (JSONata optimises the tail call), so it grows the string until doubling it
-     * once more would exceed the JVM's maximum array length and throws
-     * {@code OutOfMemoryError: Overflow: String length out of range} from that bound check, not
-     * from a filled heap. Measured in isolation against the {@code -Xmx6g} this suite's own
-     * surefire {@code argLine} sets, the expression peaks around 1.5 GB of transient garbage and
-     * completes in ~200 ms, comfortably inside the 6 GB budget: it does not exhaust the heap of
-     * the run. This is the only test that reaches the {@code OutOfMemoryError} arm of
-     * {@code JsonataEvaluator.evaluate}'s catch; the {@code StackOverflowError} arm is pinned by
+     * recursing on (JSONata optimises the tail call). Since the memory bound
+     * {@code JsonataEvaluator} now holds, the doubling trips it at the 23rd iteration &mdash;
+     * {@code 'x'} doubled 23 times is 8,388,608 characters, past
+     * {@link JsonataEvaluator#MAX_EXPRESSION_BYTES}'s 6,990,256 &mdash; and fails the state with
+     * {@code Expression evaluation memory limit exceeded} through the ordinary {@code JException}
+     * path, eight doublings short of ever reaching the 31st and nowhere near the JVM's maximum
+     * array length. Whichever of the two carries the failure, the {@code Parallel}'s own
+     * {@code Catch} still sees it, which is what this test pins: the execution still ends
+     * {@code SUCCEEDED} with {@code {"caught":true}}, matching AWS. The {@code OutOfMemoryError}
+     * arm of {@code JsonataEvaluator.evaluate}'s catch remains a guard with no cheap trigger
+     * through this library; its {@code StackOverflowError} sibling is pinned by
      * {@code JsonataEvaluatorTest.aStackOverflowErrorDuringParsingBecomesAQueryEvaluationError}.
      */
     @Test
