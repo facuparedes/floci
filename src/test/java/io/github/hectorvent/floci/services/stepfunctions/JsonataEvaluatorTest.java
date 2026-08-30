@@ -564,6 +564,33 @@ class JsonataEvaluatorTest {
         assertEquals("1.5", evaluator.evaluate("{% $parse('1.5') %}", statesVar).toString());
     }
 
+    /**
+     * The execution input reaching {@code $states.input} follows the same number model as
+     * {@code $parse} (see {@link #parse_dropsATrailingZeroOnAnIntegerValuedNumber}): both route
+     * through {@code toJsonataValue}/{@code toJsonataNumber}. Measured against real AWS
+     * (us-east-1, test-state, 2026-08-30): a Pass state with
+     * {@code Output: {"v": "{% $states.input.amount %}"}} and input {@code {"amount": 1.0}}
+     * answers {@code {"v": 1}}.
+     */
+    @Test
+    void statesInputDropsATrailingZeroOnAnIntegerValuedNumber() throws Exception {
+        JsonNode statesVar = objectMapper.readTree("{\"input\": {\"amount\": 1.0}}");
+        assertEquals("1", evaluator.evaluate("{% $states.input.amount %}", statesVar).toString());
+    }
+
+    /**
+     * Same model, the other side of the long boundary (see
+     * {@link #parse_keepsAnIntegerExactWhileItFitsInALong}). Measured against real AWS
+     * (us-east-1, test-state, 2026-08-30): input {@code {"amount": 9223372036854775808}} answers
+     * {@code {"v": 9.223372036854776E18}}.
+     */
+    @Test
+    void statesInputSwitchesToADoublePastTheLongBoundary() throws Exception {
+        JsonNode statesVar = objectMapper.readTree("{\"input\": {\"amount\": 9223372036854775808}}");
+        assertEquals("9.223372036854776E18",
+                evaluator.evaluate("{% $states.input.amount %}", statesVar).toString());
+    }
+
     @Test
     void parse_rejectsJsonAwsRejects() {
         JsonNode statesVar = objectMapper.createObjectNode();

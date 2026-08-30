@@ -179,6 +179,9 @@ JSONata's own `$string` follows AWS's number notation: a whole number is written
 `1e21` and in exponent notation from there, on both signs, so `$string(1e20)` is
 `100000000000000000000` and `$string(1e21)` is `1e+21`.
 
+The execution input reaching `$states.input` follows the same number model as `$parse`: an integer
+stays exact while it fits in a `long` and switches to a `double` past that boundary, matching AWS.
+
 JSONata's own `$formatNumber` checks its picture string against the fourteen rules of XPath F&O
 4.7.3, as AWS does, so `$formatNumber(1, "x")` fails with `D3086` rather than answering `x1`: a
 picture with no digit in it describes no number.
