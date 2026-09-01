@@ -306,6 +306,23 @@ class AwsIncludeProcessorTest {
     }
 
     @Test
+    void parametersAbsentEntirelyNamesTheTransformNodeInsteadOfLeavingAnEmptyTail() {
+        String template = """
+            Resources:
+              OrdersStateMachine:
+                Type: AWS::StepFunctions::StateMachine
+                Properties:
+                  DefinitionSubstitutions:
+                    Fn::Transform:
+                      Name: AWS::Include
+            """;
+
+        AwsException e = assertThrows(AwsException.class, () -> mergedSubstitutions(template));
+        assertEquals("Fn::Transform AWS::Include Location must be an s3://bucket/key URI, "
+                + "got {\"Name\":\"AWS::Include\"}", e.getMessage());
+    }
+
+    @Test
     void twoResourcesEachWithTheirOwnFnTransformBothMerge() throws Exception {
         // The measured corpus carries 41 Fn::Transform nodes in one template, one per resource's
         // own Resources.<id>.Properties.DefinitionSubstitutions - never a single node shared across
