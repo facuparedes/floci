@@ -69,7 +69,7 @@ class AwsIncludeProcessor {
     private void mergeObject(ObjectNode obj) {
         JsonNode transform = obj.get(FN_TRANSFORM);
         if (transform != null && AWS_INCLUDE.equals(transform.path("Name").asText(""))) {
-            spliceInclude(obj, transform.path("Parameters"));
+            spliceInclude(obj, transform);
         }
         // Walk every remaining field, including the snippet's own keys just merged in above:
         // spliceInclude already rejects a snippet carrying its own AWS::Include, so revisiting
@@ -81,8 +81,8 @@ class AwsIncludeProcessor {
         }
     }
 
-    private void spliceInclude(ObjectNode obj, JsonNode parameters) {
-        String location = describeLocation(parameters);
+    private void spliceInclude(ObjectNode obj, JsonNode transform) {
+        String location = describeLocation(transform);
         S3Location s3Location = parseS3Location(location);
         JsonNode snippet = fetchSnippet(s3Location, location);
 
@@ -100,17 +100,23 @@ class AwsIncludeProcessor {
     }
 
     /**
-     * Renders {@code parameters.Location} for an error message. A well-formed {@code Location} is
-     * a plain string, but a node such as {@code {Ref: InputValue}} - the form AWS's own
-     * {@code Fn::Transform} documentation uses in its {@code AWS::Include} example - is a mapping.
-     * {@code Ref} resolution is not implemented here, so that mapping is serialized instead, and
-     * the rejection message names it. A {@code Location} missing from {@code Parameters} entirely
-     * names the enclosing {@code Parameters} mapping instead, so the message never leaves an empty
-     * tail.
+     * Renders {@code transform.Parameters.Location} for an error message. A well-formed
+     * {@code Location} is a plain string, but a node such as {@code {Ref: InputValue}} - the form
+     * AWS's own {@code Fn::Transform} documentation uses in its {@code AWS::Include} example - is a
+     * mapping. {@code Ref} resolution is not implemented here, so that mapping is serialized
+     * instead, and the rejection message names it. A {@code Location} missing from
+     * {@code Parameters} names the enclosing {@code Parameters} mapping instead, and a
+     * {@code Parameters} missing from {@code transform} entirely names the {@code Fn::Transform}
+     * node itself. A {@code Location} present but blank is rendered as its quoted empty string,
+     * not elided, so the message never leaves an empty tail.
      */
-    private String describeLocation(JsonNode parameters) {
+    private String describeLocation(JsonNode transform) {
+        JsonNode parameters = transform.path("Parameters");
+        if (parameters.isMissingNode() || parameters.isNull()) {
+            return transform.toString();
+        }
         JsonNode locationNode = parameters.path("Location");
-        if (locationNode.isTextual()) {
+        if (locationNode.isTextual() && !locationNode.asText().isEmpty()) {
             return locationNode.asText();
         }
         JsonNode described = locationNode.isMissingNode() || locationNode.isNull() ? parameters : locationNode;
