@@ -560,7 +560,7 @@ class SamTransformProcessorTest {
     @Test
     void expandSamTemplate_apiPreservesDefinitionBodyAsBody() throws Exception {
         // A route-bearing Api carries its routes in the inline OpenAPI DefinitionBody, which
-        // must survive as the RestApi's Body — otherwise the deployed API serves no method.
+        // must survive as the RestApi's Body: otherwise the deployed API serves no method.
         JsonNode template = objectMapper.readTree("""
             {
               "Transform": "AWS::Serverless-2016-10-31",
