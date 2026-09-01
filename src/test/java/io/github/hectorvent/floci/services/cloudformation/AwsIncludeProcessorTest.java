@@ -367,7 +367,7 @@ class AwsIncludeProcessorTest {
     }
 
     @Test
-    void blankLocationRendersItsQuotedEmptyStringInsteadOfLeavingAnEmptyTail() {
+    void emptyStringLocationRendersItsQuotedEmptyStringInsteadOfLeavingAnEmptyTail() {
         String template = """
             Resources:
               OrdersStateMachine:
@@ -383,5 +383,42 @@ class AwsIncludeProcessorTest {
         AwsException e = assertThrows(AwsException.class, () -> mergedSubstitutions(template));
         assertEquals("Fn::Transform AWS::Include Location must be an s3://bucket/key URI, "
                 + "got \"\"", e.getMessage());
+    }
+
+    @Test
+    void whitespaceOnlyLocationRendersItsQuotedStringInsteadOfLeavingAnEmptyTail() {
+        String template = """
+            Resources:
+              OrdersStateMachine:
+                Type: AWS::StepFunctions::StateMachine
+                Properties:
+                  DefinitionSubstitutions:
+                    Fn::Transform:
+                      Name: AWS::Include
+                      Parameters:
+                        Location: "   "
+            """;
+
+        AwsException e = assertThrows(AwsException.class, () -> mergedSubstitutions(template));
+        assertEquals("Fn::Transform AWS::Include Location must be an s3://bucket/key URI, "
+                + "got \"   \"", e.getMessage());
+    }
+
+    @Test
+    void explicitNullParametersNamesTheTransformNodeInsteadOfLeavingAnEmptyTail() {
+        String template = """
+            Resources:
+              OrdersStateMachine:
+                Type: AWS::StepFunctions::StateMachine
+                Properties:
+                  DefinitionSubstitutions:
+                    Fn::Transform:
+                      Name: AWS::Include
+                      Parameters:
+            """;
+
+        AwsException e = assertThrows(AwsException.class, () -> mergedSubstitutions(template));
+        assertEquals("Fn::Transform AWS::Include Location must be an s3://bucket/key URI, "
+                + "got {\"Name\":\"AWS::Include\",\"Parameters\":null}", e.getMessage());
     }
 }
