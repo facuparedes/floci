@@ -19,6 +19,7 @@ import java.util.Map;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 
@@ -321,6 +322,208 @@ class AwsIncludeIntegrationTest {
             // The baseline diff still uses the merged body (stack.getTemplateBody(), untouched by
             // this fix): resubmitting the identical template must not report a spurious Modify.
             .body(not(containsString("<Action>Modify</Action>")));
+    }
+
+    @Test
+    void getTemplateStageSelectsBetweenTheMergedBodyAndTheSubmittedBody() {
+        // One stack carrying both a SAM resource and an embedded AWS::Include, so TemplateStage
+        // exercises both processors at once: Processed is the merged/SAM-expanded body
+        // (stack.getTemplateBody()) with AWS::Serverless::Function expanded away and the include
+        // merged in, Original is the caller's raw YAML (stack.getOriginalTemplateBody()), and no
+        // TemplateStage at all still defaults to Original, byte for byte.
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String bucket = "aws-include-it-stage-" + suffix;
+        String key = "stage-definition.yaml";
+        String stackName = "aws-include-stage-stack-" + suffix;
+        String functionName = "aws-include-stage-func-" + suffix;
+        String parameterName = "/aws-include-it/stage-" + suffix;
+        stacksToDelete.add(stackName);
+
+        String location = putSnippet(bucket, key, "mergedFlag: merged-value\n");
+
+        String template = """
+            AWSTemplateFormatVersion: '2010-09-09'
+            Transform: AWS::Serverless-2016-10-31
+            Resources:
+              StageFunction:
+                Type: AWS::Serverless::Function
+                Properties:
+                  FunctionName: %s
+                  Handler: index.handler
+                  Runtime: nodejs22.x
+                  InlineCode: |
+                    exports.handler = async () => ({ statusCode: 200, body: 'ok' });
+              IncludeParam:
+                Type: AWS::SSM::Parameter
+                Metadata:
+                  Fn::Transform:
+                    Name: AWS::Include
+                    Parameters:
+                      Location: %s
+                Properties:
+                  Name: %s
+                  Type: String
+                  Value: unmerged-value
+            """.formatted(functionName, location, parameterName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+            .formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetTemplate")
+            .formParam("StackName", stackName)
+            .formParam("TemplateStage", "Processed")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("AWS::Lambda::Function"))
+            .body(containsString("mergedFlag"))
+            .body(not(containsString("AWS::Serverless::Function")))
+            .body(not(containsString("Fn::Transform")));
+
+        String originalBody = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetTemplate")
+            .formParam("StackName", stackName)
+            .formParam("TemplateStage", "Original")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("AWS::Serverless::Function"))
+            .body(containsString("Fn::Transform"))
+            .body(not(containsString("mergedFlag")))
+            .extract().path("GetTemplateResponse.GetTemplateResult.TemplateBody");
+
+        String defaultStageBody = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetTemplate")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("GetTemplateResponse.GetTemplateResult.TemplateBody");
+
+        assertThat(defaultStageBody, equalTo(originalBody));
+    }
+
+    @Test
+    void getTemplateWithInvalidStageRejectsWithTheAwsEnumValidationError() {
+        // Verbatim against real AWS (measured on us-east-1): an invalid TemplateStage value is
+        // rejected with ValidationError naming the enum, on any existing stack.
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "aws-include-stage-bogus-stack-" + suffix;
+        String parameterName = "/aws-include-it/stage-bogus-" + suffix;
+        stacksToDelete.add(stackName);
+
+        String template = """
+            Resources:
+              BogusStageParam:
+                Type: AWS::SSM::Parameter
+                Properties:
+                  Name: %s
+                  Type: String
+                  Value: plain-value
+            """.formatted(parameterName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetTemplate")
+            .formParam("StackName", stackName)
+            .formParam("TemplateStage", "Bogus")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>ValidationError</Code>"))
+            .body(containsString("Value &apos;Bogus&apos; at &apos;templateStage&apos; failed to satisfy "
+                    + "constraint: Member must satisfy enum value set: [Processed, Original]"));
+    }
+
+    @Test
+    void getTemplateOnAPlainStackReturnsIdenticalBodiesAcrossStagesAndAdvertisesBothInStagesAvailable() {
+        // No transform at all: real AWS still accepts TemplateStage on a plain stack and returns
+        // the identical body for both stages (measured md5-identical on us-east-1), and
+        // StagesAvailable lists both stages on every GetTemplate call, including one with no
+        // stage requested, which floci never returned before this change.
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "aws-include-stage-plain-stack-" + suffix;
+        String parameterName = "/aws-include-it/stage-plain-" + suffix;
+        stacksToDelete.add(stackName);
+
+        String template = """
+            Resources:
+              PlainStageParam:
+                Type: AWS::SSM::Parameter
+                Properties:
+                  Name: %s
+                  Type: String
+                  Value: plain-value
+            """.formatted(parameterName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        String processedBody = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetTemplate")
+            .formParam("StackName", stackName)
+            .formParam("TemplateStage", "Processed")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("GetTemplateResponse.GetTemplateResult.TemplateBody");
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetTemplate")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("GetTemplateResponse.GetTemplateResult.TemplateBody", equalTo(processedBody))
+            .body(containsString(
+                    "<StagesAvailable><member>Original</member><member>Processed</member></StagesAvailable>"));
     }
 
     @Test
