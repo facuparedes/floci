@@ -239,17 +239,20 @@ A snippet may not itself use `AWS::Include`; nesting is rejected rather than exp
 `Location` must be a plain string; a `Ref` or another intrinsic in its place is rejected, naming
 the rejected node, rather than resolved.
 
-Three known deviations from AWS:
+Two known deviations from AWS:
 
 - The snippet is parsed with floci's CloudFormation-aware YAML parser, so it accepts CloudFormation
   YAML short tags (`!Ref`, `!Sub`, ...) where AWS's own `AWS::Include` documentation says a snippet
   does not.
-- floci enforces no `CAPABILITY_AUTO_EXPAND` on a template that declares `AWS::Include`, matching
-  that floci enforces no `CAPABILITY_*` on `CreateStack` today.
 - AWS's own `Fn::Transform` documentation shows a `Location` written as an intrinsic function (its
   example uses `Ref`) and describes it as accepted; floci does not resolve one and rejects the
   template instead. This deviation comes from reading AWS's documentation, not from a request
   measured against a real account.
+
+`CAPABILITY_AUTO_EXPAND` is not one of them. floci requires no capability for a template that
+declares `AWS::Include`, and neither does AWS on the change-set path: a `CreateChangeSet` carrying
+an embedded `Fn::Transform`/`AWS::Include` was accepted against a real account with
+`CAPABILITY_IAM` alone. The `CreateStack` path was not measured.
 
 `GetTemplateSummary` does not expand the include: it reports `AWS::Include` in the template's
 `Transform`/`DeclaredTransforms` and neither fetches nor validates the snippet, matching AWS.
