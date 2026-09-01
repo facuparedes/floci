@@ -421,4 +421,40 @@ class AwsIncludeProcessorTest {
         assertEquals("Fn::Transform AWS::Include Location must be an s3://bucket/key URI, "
                 + "got {\"Name\":\"AWS::Include\",\"Parameters\":null}", e.getMessage());
     }
+
+    @Test
+    void stringParametersNamesTheTransformNodeInsteadOfLeakingItselfAsTheLocation() {
+        String template = """
+            Resources:
+              OrdersStateMachine:
+                Type: AWS::StepFunctions::StateMachine
+                Properties:
+                  DefinitionSubstitutions:
+                    Fn::Transform:
+                      Name: AWS::Include
+                      Parameters: "s3://b/k"
+            """;
+
+        AwsException e = assertThrows(AwsException.class, () -> mergedSubstitutions(template));
+        assertEquals("Fn::Transform AWS::Include Location must be an s3://bucket/key URI, "
+                + "got {\"Name\":\"AWS::Include\",\"Parameters\":\"s3://b/k\"}", e.getMessage());
+    }
+
+    @Test
+    void listParametersNamesTheTransformNodeInsteadOfLeakingItselfAsTheLocation() {
+        String template = """
+            Resources:
+              OrdersStateMachine:
+                Type: AWS::StepFunctions::StateMachine
+                Properties:
+                  DefinitionSubstitutions:
+                    Fn::Transform:
+                      Name: AWS::Include
+                      Parameters: [1, 2]
+            """;
+
+        AwsException e = assertThrows(AwsException.class, () -> mergedSubstitutions(template));
+        assertEquals("Fn::Transform AWS::Include Location must be an s3://bucket/key URI, "
+                + "got {\"Name\":\"AWS::Include\",\"Parameters\":[1,2]}", e.getMessage());
+    }
 }
