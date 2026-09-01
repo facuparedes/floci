@@ -661,6 +661,62 @@ class SamTransformIntegrationTest {
     }
 
     @Test
+    void samHttpApi_definitionUriCreatesApiGatewayV2Routes() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "sam-http-api-uri-" + suffix;
+        String apiName = "sam-http-api-uri-" + suffix;
+        String bucketName = "sam-http-api-spec-" + suffix;
+        stacksToDelete.add(stackName);
+
+        given()
+        .when()
+            .put("/" + bucketName)
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .body("""
+                {"openapi":"3.0.1","paths":{"/from-uri":{"get":{}}}}
+                """)
+        .when()
+            .put("/" + bucketName + "/openapi.json")
+        .then()
+            .statusCode(200);
+
+        String template = """
+            AWSTemplateFormatVersion: '2010-09-09'
+            Transform: AWS::Serverless-2016-10-31
+            Resources:
+              HttpApi:
+                Type: AWS::Serverless::HttpApi
+                Properties:
+                  Name: %s
+                  DefinitionUri: s3://%s/openapi.json
+            """.formatted(apiName, bucketName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        waitForStackStatus(stackName, "CREATE_COMPLETE");
+
+        String apiId = apiIdForName(apiName);
+        given()
+        .when()
+            .get("/v2/apis/" + apiId + "/routes")
+        .then()
+            .statusCode(200)
+            .body("items.routeKey", hasItem("GET /from-uri"));
+    }
+
+    @Test
     void samHttpApi_definitionBodyReconcilesRoutesOnStackUpdate() {
         String suffix = Long.toString(System.nanoTime(), 36);
         String stackName = "sam-http-api-update-" + suffix;

@@ -1247,6 +1247,66 @@ class SamTransformProcessorTest {
     }
 
     @Test
+    void expandSamTemplate_httpApiWithBothDefinitionBodyAndDefinitionUriIsRejected() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyHttpApi": {
+                  "Type": "AWS::Serverless::HttpApi",
+                  "Properties": {
+                    "DefinitionBody": { "openapi": "3.0.1", "paths": {} },
+                    "DefinitionUri": "s3://api-specs/openapi.yaml"
+                  }
+                }
+              }
+            }
+            """);
+
+        AwsException exception = assertThrows(AwsException.class,
+                () -> processor.expandSamTemplate(template));
+
+        // Measured against real AWS, us-east-1, create-change-set: an HttpApi declaring both
+        // DefinitionBody and DefinitionUri is rejected, DefinitionUri named first, the reverse
+        // order from the equivalent StateMachine message below. floci must not silently prefer
+        // DefinitionBody and emit Body with no error.
+        assertEquals("ValidationError", exception.getErrorCode());
+        assertEquals("Resource with id [MyHttpApi] is invalid. Specify either 'DefinitionUri' "
+                        + "or 'DefinitionBody' property and not both.",
+                exception.getMessage());
+    }
+
+    @Test
+    void expandSamTemplate_httpApiWithLocalDefinitionUriIsRejected() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyHttpApi": {
+                  "Type": "AWS::Serverless::HttpApi",
+                  "Properties": {
+                    "DefinitionUri": "./openapi.yaml"
+                  }
+                }
+              }
+            }
+            """);
+
+        AwsException exception = assertThrows(AwsException.class,
+                () -> processor.expandSamTemplate(template));
+
+        // Measured against real AWS, us-east-1, create-change-set: a local-path DefinitionUri
+        // (the shape an unpackaged `sam` template carries) is rejected with the same string-form
+        // wording the StateMachine arm already carries, not silently accepted with no Body and
+        // no BodyS3Location.
+        assertEquals("ValidationError", exception.getErrorCode());
+        assertEquals("Resource with id [MyHttpApi] is invalid. 'DefinitionUri' is not a valid S3 "
+                        + "Uri of the form 's3://bucket/key' with optional versionId query "
+                        + "parameter.",
+                exception.getMessage());
+    }
+
+    @Test
     void expandSamTemplate_stateMachineBecomesStepFunctionsStateMachine() throws Exception {
         JsonNode template = objectMapper.readTree("""
             {
@@ -1706,5 +1766,66 @@ class SamTransformProcessorTest {
                 "no DefinitionUri was given, so no DefinitionS3Location must appear");
         assertEquals("Done", props.path("Definition").path("StartAt").asText());
         assertEquals("Pass", props.path("Definition").path("States").path("Done").path("Type").asText());
+    }
+
+    @Test
+    void expandSamTemplate_stateMachineWithNeitherDefinitionNorDefinitionUriIsRejected() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Properties": {
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role"
+                  }
+                }
+              }
+            }
+            """);
+
+        AwsException exception = assertThrows(AwsException.class,
+                () -> processor.expandSamTemplate(template));
+
+        // Measured against real AWS, us-east-1, create-change-set: a StateMachine with neither
+        // Definition nor DefinitionUri is rejected before a single resource is provisioned,
+        // rather than emitting an AWS::StepFunctions::StateMachine with no definition at all.
+        assertEquals("ValidationError", exception.getErrorCode());
+        assertEquals("Resource with id [OrdersStateMachine] is invalid. Either 'Definition' or "
+                        + "'DefinitionUri' property must be specified.",
+                exception.getMessage());
+    }
+
+    @Test
+    void expandSamTemplate_stateMachineWithBothDefinitionAndDefinitionUriIsRejected() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Properties": {
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "Definition": {
+                      "StartAt": "Done",
+                      "States": { "Done": { "Type": "Pass", "End": true } }
+                    },
+                    "DefinitionUri": "s3://asl-definitions/orders.asl.json"
+                  }
+                }
+              }
+            }
+            """);
+
+        AwsException exception = assertThrows(AwsException.class,
+                () -> processor.expandSamTemplate(template));
+
+        // Measured against real AWS, us-east-1, create-change-set: a StateMachine declaring both
+        // Definition and a resolvable DefinitionUri is rejected, not expanded into one native
+        // resource carrying both Definition and DefinitionS3Location.
+        assertEquals("ValidationError", exception.getErrorCode());
+        assertEquals("Resource with id [OrdersStateMachine] is invalid. Specify either "
+                        + "'Definition' or 'DefinitionUri' property and not both.",
+                exception.getMessage());
     }
 }
