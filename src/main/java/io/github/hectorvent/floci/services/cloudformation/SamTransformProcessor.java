@@ -11,6 +11,8 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Expands {@code AWS::Serverless-2016-10-31} SAM resource types into standard CloudFormation
@@ -21,6 +23,16 @@ class SamTransformProcessor {
 
     private static final Logger LOG = Logger.getLogger(SamTransformProcessor.class);
     private static final String SAM_TRANSFORM = "AWS::Serverless-2016-10-31";
+
+    /**
+     * Matches a valid {@code s3://bucket/key} URI, optionally suffixed with a
+     * {@code ?versionId=<id>} query parameter, the way real SAM packages a {@code DefinitionUri}.
+     * The key is non-greedy so only a trailing {@code ?versionId=} is split off; S3 permits a
+     * literal {@code ?} in a key (for example {@code s3://bucket/key?foo=1}), and such a key must
+     * still match here rather than being rejected as an invalid URI.
+     */
+    private static final Pattern S3_DEFINITION_URI = Pattern.compile(
+            "^s3://(?<bucket>[^/?]+)/(?<key>.+?)(?:\\?versionId=(?<version>.+))?$");
 
     private final ObjectMapper objectMapper;
 
@@ -84,16 +96,37 @@ class SamTransformProcessor {
             String type = resDef.path("Type").asText();
             JsonNode properties = resDef.path("Properties");
 
+            // SAM CLI writes SamResourceId (in Metadata) for every AWS::Serverless::* resource it
+            // transforms, not only state machines, and CloudFormation carries a resource's
+            // Metadata/DependsOn/Condition/DeletionPolicy/UpdateReplacePolicy through a transform
+            // unchanged. Each arm's generated resource lands back at the same logicalId key, so
+            // copyResourceLevelAttributes runs once per arm, right after that arm builds its node.
             switch (type) {
-                case "AWS::Serverless::Function" ->
-                        expandServerlessFunction(logicalId, mergeGlobals(globals, "Function", properties), expandedResources);
-                case "AWS::Serverless::SimpleTable" ->
-                        expandServerlessSimpleTable(logicalId, mergeGlobals(globals, "SimpleTable", properties), expandedResources);
-                case "AWS::Serverless::Api" ->
-                        expandServerlessApi(logicalId, mergeGlobals(globals, "Api", properties), expandedResources);
-                case "AWS::Serverless::HttpApi" ->
-                        expandServerlessHttpApi(logicalId, mergeGlobals(globals, "HttpApi", properties),
-                                httpApiRoutes, expandedResources);
+                case "AWS::Serverless::Function" -> {
+                    expandServerlessFunction(logicalId, mergeGlobals(globals, "Function", properties), expandedResources);
+                    copyResourceLevelAttributes(resDef, (ObjectNode) expandedResources.path(logicalId));
+                }
+                case "AWS::Serverless::SimpleTable" -> {
+                    expandServerlessSimpleTable(logicalId, mergeGlobals(globals, "SimpleTable", properties), expandedResources);
+                    copyResourceLevelAttributes(resDef, (ObjectNode) expandedResources.path(logicalId));
+                }
+                case "AWS::Serverless::Api" -> {
+                    expandServerlessApi(logicalId, mergeGlobals(globals, "Api", properties), expandedResources);
+                    copyResourceLevelAttributes(resDef, (ObjectNode) expandedResources.path(logicalId));
+                }
+                case "AWS::Serverless::HttpApi" -> {
+                    expandServerlessHttpApi(logicalId, mergeGlobals(globals, "HttpApi", properties),
+                            httpApiRoutes, expandedResources);
+                    copyResourceLevelAttributes(resDef, (ObjectNode) expandedResources.path(logicalId));
+                }
+                case "AWS::Serverless::StateMachine" ->
+                        // Globals.StateMachine is intentionally not merged in: SAM's schema accepts
+                        // exactly one key there (PropagateTags), unimplemented here, and
+                        // mergeGlobals deep-merges any key it is given, which would make floci
+                        // honour a Globals.StateMachine.Role that AWS itself rejects.
+                        // copyResourceLevelAttributes runs inside expandServerlessStateMachine
+                        // itself (its one caller already owning the source resDef).
+                        expandServerlessStateMachine(logicalId, resDef, expandedResources);
                 default -> LOG.debugv("Unsupported SAM resource type: {0} ({1})", type, logicalId);
             }
         }
@@ -217,7 +250,7 @@ class SamTransformProcessor {
         if (!definitionBody.isMissingNode() && !definitionBody.isNull()) {
             apiProps.set("Body", definitionBody.deepCopy());
         } else {
-            ObjectNode bodyS3Location = buildHttpApiBodyS3Location(properties.path("DefinitionUri"));
+            ObjectNode bodyS3Location = samUriToS3Location(properties.path("DefinitionUri"));
             if (bodyS3Location != null) {
                 apiProps.set("BodyS3Location", bodyS3Location);
             }
@@ -1091,29 +1124,159 @@ class SamTransformProcessor {
     }
 
     /**
-     * {@code DefinitionUri} is SAM's S3-backed OpenAPI source. ApiGatewayV2 accepts the same
-     * source through {@code BodyS3Location}, with the S3 URI split into its bucket and key.
+     * Expands {@code AWS::Serverless::StateMachine} into {@code AWS::StepFunctions::StateMachine}.
+     * Every mapped value is copied as a node, never read with {@code asText()}: {@code RoleArn}
+     * and {@code StateMachineName} are commonly intrinsics ({@code Fn::GetAtt}, {@code Fn::Sub})
+     * in the templates SAM itself produces, and {@code JsonNode.asText()} on an object node
+     * silently returns {@code ""}, dropping the intrinsic instead of failing loudly.
+     *
+     * <p>Every sibling key of {@code Type} and {@code Properties} on the SAM resource node (for
+     * example {@code Metadata}, {@code DependsOn}, {@code Condition}, {@code DeletionPolicy},
+     * {@code UpdateReplacePolicy}) is carried onto the emitted native resource, the way
+     * CloudFormation itself carries a transformed resource's own attributes through.
+     *
+     * <p>Does not handle {@code Events}, {@code Policies}, {@code PermissionsBoundary},
+     * {@code AutoPublishAlias} or {@code UseAliasAsEventTarget}: none appears in a corpus of 174
+     * {@code AWS::Serverless::StateMachine} declarations across 20 source repositories measured
+     * against real AWS.
      */
-    private ObjectNode buildHttpApiBodyS3Location(JsonNode definitionUri) {
+    private void expandServerlessStateMachine(String logicalId, JsonNode samResource, ObjectNode resources) {
+        resources.remove(logicalId);
+        JsonNode properties = samResource.path("Properties");
+
+        ObjectNode stateMachineDef = objectMapper.createObjectNode();
+        stateMachineDef.put("Type", "AWS::StepFunctions::StateMachine");
+        copyResourceLevelAttributes(samResource, stateMachineDef);
+        ObjectNode smProps = objectMapper.createObjectNode();
+
+        copyRenamed(properties, "Name", smProps, "StateMachineName");
+        copyRenamed(properties, "Type", smProps, "StateMachineType");
+        copyRenamed(properties, "Role", smProps, "RoleArn");
+        copyRenamed(properties, "Logging", smProps, "LoggingConfiguration");
+        copyRenamed(properties, "Tracing", smProps, "TracingConfiguration");
+        copyIfPresent(properties, "DefinitionSubstitutions", smProps);
+        copyIfPresent(properties, "Definition", smProps);
+
+        JsonNode definitionUri = properties.path("DefinitionUri");
+        if (!definitionUri.isMissingNode() && !definitionUri.isNull()) {
+            ObjectNode s3Location = samUriToS3Location(definitionUri);
+            if (s3Location != null) {
+                smProps.set("DefinitionS3Location", s3Location);
+            } else if (definitionUri.isTextual()) {
+                // Real SAM rejects the same shape the same way: a DefinitionUri that is not a
+                // packaged 's3://bucket/key' reference (a local path, or an s3:// value with no
+                // key) fails the transform itself, before CloudFormation ever sees the resource.
+                // Failing here beats today's silent CREATE_COMPLETE with a stub ARN.
+                throw new AwsException("ValidationError",
+                        "Resource with id [" + logicalId + "] is invalid. 'DefinitionUri' is not "
+                                + "a valid S3 Uri of the form 's3://bucket/key' with optional "
+                                + "versionId query parameter.",
+                        400);
+            }
+        }
+
+        smProps.set("Tags", samTagsToCfnTags(properties.path("Tags")));
+
+        stateMachineDef.set("Properties", smProps);
+        resources.set(logicalId, stateMachineDef);
+    }
+
+    /**
+     * Copies every sibling key of {@code Type} and {@code Properties} from {@code source} onto
+     * {@code target}, the way CloudFormation carries a resource's {@code Metadata},
+     * {@code DependsOn}, {@code Condition}, {@code DeletionPolicy} and
+     * {@code UpdateReplacePolicy} through a transform unchanged.
+     */
+    private void copyResourceLevelAttributes(JsonNode source, ObjectNode target) {
+        Iterator<Map.Entry<String, JsonNode>> fields = source.fields();
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> field = fields.next();
+            String key = field.getKey();
+            if ("Type".equals(key) || "Properties".equals(key)) {
+                continue;
+            }
+            target.set(key, field.getValue().deepCopy());
+        }
+    }
+
+    /**
+     * Converts SAM's string-to-string {@code Tags} map into the {@code {Key, Value}} list
+     * {@code AWS::StepFunctions::StateMachine} reads (see {@code parseCfnTags} in
+     * {@code CloudFormationResourceProvisioner}, which returns an empty set for anything that is
+     * not an array; a verbatim map copy would silently tag nothing). Emitted unconditionally,
+     * even for an absent or empty {@code Tags} map: measured against real AWS, us-east-1, a
+     * change set's Processed template for a state machine with no source {@code Tags} declared
+     * still carried exactly {@code [{"Key": "stateMachine:createdBy", "Value": "SAM"}]}, so real
+     * SAM adds this tag regardless of what the template declares.
+     *
+     * <p>A tag value keeps its own JSON type (number, intrinsic) in this expanded template. The
+     * native provisioner's {@code parseCfnTags} still reads every value with {@code asText("")}
+     * once it applies the tags to the state machine, so the type is preserved only up to the
+     * expanded template, not into the deployed resource.
+     */
+    private ArrayNode samTagsToCfnTags(JsonNode tagsMap) {
+        ArrayNode tags = objectMapper.createArrayNode();
+        ObjectNode samTag = objectMapper.createObjectNode();
+        samTag.put("Key", "stateMachine:createdBy");
+        samTag.put("Value", "SAM");
+        tags.add(samTag);
+
+        if (tagsMap.isObject()) {
+            Iterator<Map.Entry<String, JsonNode>> fields = tagsMap.fields();
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> entry = fields.next();
+                ObjectNode tag = objectMapper.createObjectNode();
+                tag.put("Key", entry.getKey());
+                tag.set("Value", entry.getValue().deepCopy());
+                tags.add(tag);
+            }
+        }
+        return tags;
+    }
+
+    /** Copies {@code source.<field>} to {@code target.<targetField>} when present and non-null. */
+    private void copyRenamed(JsonNode source, String field, ObjectNode target, String targetField) {
+        JsonNode value = source.path(field);
+        if (!value.isMissingNode() && !value.isNull()) {
+            target.set(targetField, value.deepCopy());
+        }
+    }
+
+    /**
+     * Splits a SAM {@code *Uri} property into the {@code {Bucket, Key}} (or
+     * {@code {Bucket, Key, Version}}) shape the native ApiGatewayV2 {@code BodyS3Location} and
+     * Step Functions {@code DefinitionS3Location} properties both accept. Accepts a textual
+     * {@code s3://bucket/key} URI, optionally suffixed with {@code ?versionId=<id>}, or an object
+     * form of {@code {Bucket, Key, Version}}. Shared by {@link #expandServerlessHttpApi} (for
+     * {@code DefinitionUri} to {@code BodyS3Location}) and {@link #expandServerlessStateMachine}
+     * (for {@code DefinitionUri} to {@code DefinitionS3Location}).
+     *
+     * <p>Returns {@code null} for an absent property and for any textual value that is not a
+     * valid {@code s3://bucket/key} URI, whether that is a local path or an {@code s3://} value
+     * with no key: the two are indistinguishable here on purpose, since only the caller knows
+     * whether an invalid value is a silent no-op (HttpApi) or a hard {@code ValidationError}
+     * (StateMachine, see {@link #expandServerlessStateMachine}).
+     */
+    private ObjectNode samUriToS3Location(JsonNode definitionUri) {
         if (definitionUri == null || definitionUri.isMissingNode() || definitionUri.isNull()) {
             return null;
         }
-        ObjectNode location = objectMapper.createObjectNode();
         if (definitionUri.isTextual()) {
-            String uri = definitionUri.asText();
-            if (!uri.startsWith("s3://")) {
+            Matcher matcher = S3_DEFINITION_URI.matcher(definitionUri.asText());
+            if (!matcher.matches()) {
                 return null;
             }
-            String withoutScheme = uri.substring("s3://".length());
-            int slash = withoutScheme.indexOf('/');
-            if (slash <= 0 || slash == withoutScheme.length() - 1) {
-                return null;
+            ObjectNode location = objectMapper.createObjectNode();
+            location.put("Bucket", matcher.group("bucket"));
+            location.put("Key", matcher.group("key"));
+            String version = matcher.group("version");
+            if (version != null) {
+                location.put("Version", version);
             }
-            location.put("Bucket", withoutScheme.substring(0, slash));
-            location.put("Key", withoutScheme.substring(slash + 1));
             return location;
         }
         if (definitionUri.isObject()) {
+            ObjectNode location = objectMapper.createObjectNode();
             copyIfPresent(definitionUri, "Bucket", location);
             copyIfPresent(definitionUri, "Key", location);
             copyIfPresent(definitionUri, "Version", location);
@@ -1125,11 +1288,9 @@ class SamTransformProcessor {
         return null;
     }
 
+    /** Copies {@code source.<field>} to {@code target.<field>} when present and non-null. */
     private void copyIfPresent(JsonNode source, String field, ObjectNode target) {
-        JsonNode value = source.path(field);
-        if (!value.isMissingNode() && !value.isNull()) {
-            target.set(field, value.deepCopy());
-        }
+        copyRenamed(source, field, target, field);
     }
 
     private String mapSamAttributeType(String samType) {

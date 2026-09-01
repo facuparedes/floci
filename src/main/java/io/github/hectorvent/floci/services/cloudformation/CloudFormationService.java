@@ -223,8 +223,20 @@ public class CloudFormationService implements ResourceProvider {
                                       boolean attachToReviewInProgressStack) {
         String resolvedTemplate = resolveTemplate(templateBody, templateUrl);
 
+        // Real CloudFormation runs a declared macro (here, only AWS::Serverless-2016-10-31)
+        // before it ever evaluates the template's own resources or conditions. On real AWS,
+        // create-change-set against a template with an invalid SAM resource (for example a local,
+        // unpackaged DefinitionUri) does not fail the API call: it creates the change set and
+        // marks it FAILED, with the transform's own error in StatusReason. Match that here instead
+        // of throwing, so this failure is reported by the change set, not by a 400 on creation.
+        String samTransformFailureReason = samTransformFailureReason(stackName, resolvedTemplate);
+
         // Reject an unresolvable condition dependency graph up front, before any stack state is
         // created, so CreateStack/UpdateStack fail synchronously the way real CloudFormation does.
+        // Unconditional: validateConditionDependencies already returns immediately for any
+        // template declaring the SAM transform, whether or not that transform succeeded, so
+        // gating this call on samTransformFailureReason == null duplicates that check for no
+        // effect.
         validateConditionDependencies(resolvedTemplate, parameters, region, accountId);
 
         // A CREATE change set against a name that already has a stack of any status - including
@@ -290,8 +302,14 @@ public class CloudFormationService implements ResourceProvider {
             cs.setTemplateBody(resolvedTemplate);
             cs.setParameters(parameters);
             cs.setCapabilities(capabilities);
-            cs.setStatus("CREATE_COMPLETE");
-            cs.setExecutionStatus("AVAILABLE");
+            if (samTransformFailureReason != null) {
+                cs.setStatus("FAILED");
+                cs.setExecutionStatus("UNAVAILABLE");
+                cs.setStatusReason(samTransformFailureReason);
+            } else {
+                cs.setStatus("CREATE_COMPLETE");
+                cs.setExecutionStatus("AVAILABLE");
+            }
             target.getChangeSets().put(changeSetName, cs);
             created[0] = cs;
             return target;
@@ -299,6 +317,46 @@ public class CloudFormationService implements ResourceProvider {
 
         persistStack(stack);
         return created[0];
+    }
+
+    /**
+     * Returns the change set's {@code StatusReason} when {@code templateBody} declares the SAM
+     * transform and that transform fails, {@code null} when the transform is absent or succeeds.
+     * The wrapping sentence mirrors real CloudFormation's own framing, measured against real AWS,
+     * us-east-1: {@code "Transform AWS::Serverless-2016-10-31 failed with: Invalid Serverless
+     * Application Specification document. Number of errors found: 1. "} followed by the
+     * transform's own per-resource message. The count is always 1: {@code expandSamTemplate}
+     * throws on the first bad resource rather than accumulating them.
+     */
+    private String samTransformFailureReason(String stackName, String templateBody) {
+        JsonNode template;
+        try {
+            template = parseTemplate(templateBody);
+        } catch (Exception e) {
+            // Template parse failures are reported by validateConditionDependencies and by
+            // execution itself, with their own messages; not this transform-specific one.
+            return null;
+        }
+        if (!samTransformProcessor.hasSamTransform(template)) {
+            return null;
+        }
+        try {
+            samTransformProcessor.expandSamTemplate(template);
+            return null;
+        } catch (AwsException e) {
+            return "Transform AWS::Serverless-2016-10-31 failed with: Invalid Serverless "
+                    + "Application Specification document. Number of errors found: 1. "
+                    + e.getMessage();
+        } catch (Exception e) {
+            // Anything other than the transform's own validation error (a ClassCastException or
+            // NPE from inside expandSamTemplate) is a real bug, not a template-authoring mistake.
+            // Swallowing it here would report the change set CREATE_COMPLETE while the same
+            // exception resurfaces unlogged when the change set is later executed. Log it with the
+            // stack name and let it fail loud instead.
+            LOG.errorv("Stack {0} SAM transform preflight failed unexpectedly: {1}",
+                    stackName, e.getMessage());
+            throw e;
+        }
     }
 
     // ── DescribeChangeSet ─────────────────────────────────────────────────────
@@ -319,6 +377,12 @@ public class CloudFormationService implements ResourceProvider {
      * executed a template) report every resource with a truthy {@code Condition} as an Add.
      */
     public List<ResourceChange> computeChangeSetChanges(ChangeSet cs, String region) {
+        if ("FAILED".equals(cs.getStatus())) {
+            // A SAM transform failure already recorded by createChangeSet (see
+            // samTransformFailureReason): the change set carries 0 changes, matching real
+            // CloudFormation's own CreateChangeSet response for the same failure.
+            return List.of();
+        }
         Stack stack = getStackOrThrow(cs.getStackName(), region);
         try {
             JsonNode newTemplate = parseTemplate(cs.getTemplateBody());
@@ -466,12 +530,45 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     /**
+     * Entry point for the {@code ExecuteChangeSet} operation itself, as opposed to the execute that
+     * {@code CreateStack}/{@code UpdateStack} run internally right after creating their own change
+     * set.
+     *
+     * <p>Real CloudFormation refuses to execute a change set that is not {@code AVAILABLE}, for
+     * example one a failed SAM transform already marked {@code FAILED}/{@code UNAVAILABLE}: it
+     * throws {@code InvalidChangeSetStatus}, naming the change set's ARN and its current status,
+     * and leaves the stack exactly where it was. Routing that check through a separate entry point
+     * keeps {@code CreateStack}/{@code UpdateStack} able to reach {@code CREATE_FAILED} (or its
+     * update equivalent) when their own change set failed - executing it unconditionally is how
+     * that failure surfaces on those paths, and floci must still expose it there.
+     */
+    public Future<?> executeChangeSetForRequest(String stackName, String changeSetName, String region) {
+        Stack stack = getStackOrThrow(stackName, region);
+        ChangeSet cs = stack.getChangeSets().get(resolveChangeSetName(changeSetName));
+        if (cs == null) {
+            throw new AwsException("ChangeSetNotFoundException",
+                    "ChangeSet [" + changeSetName + "] does not exist", 400);
+        }
+        if (!"AVAILABLE".equals(cs.getExecutionStatus())) {
+            throw new AwsException("InvalidChangeSetStatus",
+                    "ChangeSet [" + cs.getChangeSetId() + "] cannot be executed in its current "
+                            + "status of [" + cs.getStatus() + "]", 400);
+        }
+        return executeChangeSet(stackName, changeSetName, region, regionResolver.getAccountId());
+    }
+
+    /**
      * Executes a change set, provisioning its resources into {@code accountId}'s namespace.
      *
      * <p>Provisioning runs on a background executor thread that has no inherited request scope, so
      * the downstream service calls would otherwise fall back to the default account. The resources
      * are materialized under a synthetic request scope bound to {@code accountId} so a single-stack
      * deployment lands in the caller's account, and a StackSet instance lands in its target account.
+     *
+     * <p>Unlike {@link #executeChangeSetForRequest}, this does not refuse a non-{@code AVAILABLE}
+     * change set: {@code CreateStack}/{@code UpdateStack} call this directly right after creating
+     * their own change set, and must still reach {@code CREATE_FAILED} (or its update equivalent)
+     * when that change set failed, for example from a failed SAM transform.
      */
     public Future<?> executeChangeSet(String stackName, String changeSetName, String region, String accountId) {
         Stack stack = getStackOrThrow(stackName, region);

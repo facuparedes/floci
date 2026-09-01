@@ -246,6 +246,7 @@ public class CloudFormationQueryHandler {
                     .elem("StackName", cs.getStackName())
                     .elem("Status", cs.getStatus())
                     .elem("ExecutionStatus", cs.getExecutionStatus())
+                    .elem("StatusReason", cs.getStatusReason())
                     .start("Changes");
             for (CloudFormationService.ResourceChange change : changes) {
                 xml.start("member")
@@ -277,7 +278,7 @@ public class CloudFormationQueryHandler {
         String stackName = params.getFirst("StackName");
         String changeSetName = params.getFirst("ChangeSetName");
         try {
-            cfnService.executeChangeSet(stackName, changeSetName, region);
+            cfnService.executeChangeSetForRequest(stackName, changeSetName, region);
         } catch (AwsException e) {
             return xmlError(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
         }

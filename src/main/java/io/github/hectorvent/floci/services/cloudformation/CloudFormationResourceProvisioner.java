@@ -4141,7 +4141,7 @@ public class CloudFormationResourceProvisioner {
         JsonNode tracingConfiguration = resolveStateMachineTracingConfiguration(props, engine);
         JsonNode encryptionConfiguration = resolveStateMachineEncryptionConfiguration(props, engine);
 
-        StateMachine existing = findStateMachine(r.getPhysicalId());
+        StateMachine existing = findExistingOrStubbedStateMachine(r.getPhysicalId());
         String desiredNameMode = hasExplicitName ? NAME_MODE_EXPLICIT : NAME_MODE_GENERATED;
         String previousNameMode = r.getAttributes().get(SFN_NAME_MODE_ATTR);
         if (existing != null && previousNameMode == null) {
@@ -4234,6 +4234,19 @@ public class CloudFormationResourceProvisioner {
         r.getAttributes().put(SFN_NAME_MODE_ATTR, desiredNameMode);
     }
 
+    /** Matches the non-ARN stub physical id the default provisioning arm writes, {@code <logicalId>-<8 hex>} (see :523). */
+    private static final Pattern STUB_PHYSICAL_ID = Pattern.compile("^[A-Za-z0-9]+-[0-9a-f]{8}$");
+
+    private static boolean isStubPhysicalId(String physicalId) {
+        return STUB_PHYSICAL_ID.matcher(physicalId).matches();
+    }
+
+    /**
+     * Looks up a state machine by ARN, treating {@code StateMachineDoesNotExist} as "not found".
+     * An {@code InvalidArn} error is not swallowed here: every caller of this method reads an ARN
+     * this floci instance itself recorded (a cleanup or rollback snapshot), so a malformed value
+     * reaching {@code describeStateMachine} is a real anomaly, not a legitimate "not found" case.
+     */
     private StateMachine findStateMachine(String stateMachineArn) {
         if (stateMachineArn == null || stateMachineArn.isBlank()) {
             return null;
@@ -4242,6 +4255,31 @@ public class CloudFormationResourceProvisioner {
             return stepFunctionsService.describeStateMachine(stateMachineArn);
         } catch (AwsException e) {
             if ("StateMachineDoesNotExist".equals(e.getErrorCode())) {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Same as {@link #findStateMachine}, but additionally treats {@code InvalidArn} as "not found"
+     * when {@code physicalId} matches the stub shape a pre-SAM-expansion floci build wrote
+     * ({@code <logicalId>-<8 hex>}, produced at :523). A stack whose
+     * {@code AWS::Serverless::StateMachine} resource was provisioned before floci expanded SAM
+     * types carries that stub value into its next update; without this, {@code describeStateMachine}
+     * throws {@code InvalidArn} for it and the update fails instead of creating the real resource.
+     * Used only at the provisioning entry point, where that upgrade path is legitimate: unlike
+     * {@link #findStateMachine}'s other callers, a stub here is expected, not an anomaly.
+     */
+    private StateMachine findExistingOrStubbedStateMachine(String physicalId) {
+        if (physicalId == null || physicalId.isBlank()) {
+            return null;
+        }
+        try {
+            return stepFunctionsService.describeStateMachine(physicalId);
+        } catch (AwsException e) {
+            if ("StateMachineDoesNotExist".equals(e.getErrorCode())
+                    || ("InvalidArn".equals(e.getErrorCode()) && isStubPhysicalId(physicalId))) {
                 return null;
             }
             throw e;
