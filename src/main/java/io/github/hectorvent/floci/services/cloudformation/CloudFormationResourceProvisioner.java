@@ -4844,7 +4844,7 @@ public class CloudFormationResourceProvisioner {
         // resources and methods. putRestApi also overwrites the API's name and description from
         // the document's info, which real AWS does not do: the declared Name always wins, so
         // the resolved name is re-applied immediately after.
-        JsonNode openApiDocument = resolveRestApiOpenApiDocument(props, engine);
+        JsonNode openApiDocument = resolveOpenApiDocument(props, engine);
         if (openApiDocument != null) {
             apiGatewayService.putRestApi(region, api.getId(), "overwrite", openApiDocument.toString());
             apiGatewayService.updateRestApi(region, api.getId(),
@@ -4991,7 +4991,7 @@ public class CloudFormationResourceProvisioner {
      */
     private void reconcileApiGatewayV2BodyRoutes(StackResource r, String region, String apiId, JsonNode props,
                                                  CloudFormationTemplateEngine engine) {
-        JsonNode body = resolveRestApiOpenApiDocument(props, engine);
+        JsonNode body = resolveOpenApiDocument(props, engine);
         ApiGatewayV2BodyResourceState previous = null;
         try {
             previous = snapshotApiGatewayV2BodyResources(r, region, apiId);
@@ -5027,7 +5027,7 @@ public class CloudFormationResourceProvisioner {
                 replacement.authorizerIds());
     }
 
-    private JsonNode resolveRestApiOpenApiDocument(JsonNode props, CloudFormationTemplateEngine engine) {
+    private JsonNode resolveOpenApiDocument(JsonNode props, CloudFormationTemplateEngine engine) {
         if (props == null) {
             return null;
         }
