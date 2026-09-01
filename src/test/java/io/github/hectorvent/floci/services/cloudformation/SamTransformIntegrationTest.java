@@ -1168,6 +1168,62 @@ class SamTransformIntegrationTest {
     }
 
     @Test
+    void samStateMachine_withIntrinsicDefinitionUri_createChangeSetReportsFailedStatus() {
+        // Measured against real AWS, us-east-1: DefinitionUri as an intrinsic (no literal
+        // Bucket/Key) fails the SAM transform itself with the object-form wording, the same
+        // Status: FAILED / ExecutionStatus: UNAVAILABLE / 0 Changes shape as the local-path and
+        // bucket-only cases. Left unrejected, this shape reaches CREATE_COMPLETE against floci
+        // while real AWS already reports FAILED at create-change-set time.
+        String stackName = "sam-sfn-changeset-intrinsic-uri-stack";
+        stacksToDelete.add(stackName);
+
+        String template = """
+            AWSTemplateFormatVersion: '2010-09-09'
+            Transform: AWS::Serverless-2016-10-31
+            Resources:
+              OrdersStateMachine:
+                Type: AWS::Serverless::StateMachine
+                Properties:
+                  Name: sam-orders-changeset-intrinsic-sm
+                  Role: arn:aws:iam::000000000000:role/orders-sfn-role
+                  DefinitionUri:
+                    Fn::Sub: s3://${SpecBucket}/orders.asl.json
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "initial")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+            .formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Id>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "initial")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Status>FAILED</Status>"))
+            .body(containsString("<ExecutionStatus>UNAVAILABLE</ExecutionStatus>"))
+            .body(containsString("<StatusReason>Transform AWS::Serverless-2016-10-31 failed "
+                    + "with: Invalid Serverless Application Specification document. Number of "
+                    + "errors found: 1. Resource with id [OrdersStateMachine] is invalid. "
+                    + "&apos;DefinitionUri&apos; requires Bucket and Key properties to be "
+                    + "specified.</StatusReason>"))
+            .body(not(containsString("<member>")));
+    }
+
+    @Test
     void samStateMachine_withLocalDefinitionUri_executeChangeSetIsRejected() {
         // A change set a failed SAM transform already marked FAILED/UNAVAILABLE cannot be
         // executed. Real CloudFormation refuses ExecuteChangeSet with InvalidChangeSetStatus,

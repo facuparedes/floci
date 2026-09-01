@@ -1330,6 +1330,39 @@ class SamTransformProcessorTest {
     }
 
     @Test
+    void expandSamTemplate_stateMachineWithIntrinsicDefinitionUriIsRejected() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Properties": {
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "DefinitionUri": { "Fn::Sub": "s3://${SpecBucket}/orders.asl.json" }
+                  }
+                }
+              }
+            }
+            """);
+
+        AwsException exception = assertThrows(AwsException.class,
+                () -> processor.expandSamTemplate(template));
+
+        // Measured against real AWS, us-east-1, create-change-set: an intrinsic DefinitionUri
+        // (no literal Bucket/Key) fails the SAM transform with the object-form wording, distinct
+        // from the string-form wording the local-path and bucket-only cases above carry. Left
+        // unrejected, samUriToS3Location passes the intrinsic through unchanged, CloudFormation
+        // collapses it into a TextNode, and CloudFormationResourceProvisioner throws
+        // "DefinitionS3Location requires Bucket and Key" only once provisioning starts, one step
+        // later than real AWS's own change-set-time failure.
+        assertEquals("ValidationError", exception.getErrorCode());
+        assertEquals("Resource with id [OrdersStateMachine] is invalid. 'DefinitionUri' requires "
+                        + "Bucket and Key properties to be specified.",
+                exception.getMessage());
+    }
+
+    @Test
     void expandSamTemplate_stateMachineWithVersionedDefinitionUriSplitsVersion() throws Exception {
         JsonNode template = objectMapper.readTree("""
             {
