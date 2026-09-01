@@ -236,12 +236,6 @@ class SamTransformProcessor {
                                          List<HttpApiRoute> allRoutes, ObjectNode resources) {
         resources.remove(logicalId);
 
-        JsonNode definitionBody = properties.path("DefinitionBody");
-        JsonNode definitionUri = properties.path("DefinitionUri");
-        boolean hasDefinitionBody = isPropertyPresent(definitionBody);
-        boolean hasDefinitionUri = isPropertyPresent(definitionUri);
-        rejectBothDefinitionSources(logicalId, "DefinitionUri", "DefinitionBody", hasDefinitionUri && hasDefinitionBody);
-
         ObjectNode apiDef = objectMapper.createObjectNode();
         apiDef.put("Type", "AWS::ApiGatewayV2::Api");
         ObjectNode apiProps = objectMapper.createObjectNode();
@@ -255,11 +249,7 @@ class SamTransformProcessor {
         // declaring neither DefinitionBody nor DefinitionUri is also accepted: measured against
         // real AWS, us-east-1, create-change-set, it still expands to a bare
         // AWS::ApiGatewayV2::Api and its default stage, carrying no Body and no BodyS3Location.
-        if (hasDefinitionBody) {
-            apiProps.set("Body", definitionBody.deepCopy());
-        } else if (hasDefinitionUri) {
-            resolveDefinitionUriOrThrow(definitionUri, "BodyS3Location", logicalId, apiProps);
-        }
+        applyDefinitionSource(logicalId, properties, apiProps);
         apiDef.set("Properties", apiProps);
         resources.set(logicalId, apiDef);
 
@@ -1089,21 +1079,14 @@ class SamTransformProcessor {
         }
         copyIfPresent(properties, "Description", apiProps);
 
-        JsonNode definitionBody = properties.path("DefinitionBody");
-        JsonNode definitionUri = properties.path("DefinitionUri");
-        boolean hasDefinitionBody = isPropertyPresent(definitionBody);
-        boolean hasDefinitionUri = isPropertyPresent(definitionUri);
-        rejectBothDefinitionSources(logicalId, "DefinitionUri", "DefinitionBody", hasDefinitionUri && hasDefinitionBody);
-
         // Preserve the inline OpenAPI document so the REST API provisioner can materialize the
         // resources and methods declared by SAM DefinitionBody. An Api declaring neither
-        // DefinitionBody nor DefinitionUri is also accepted, and behaves exactly as before: no
-        // Body and no BodyS3Location.
-        if (hasDefinitionBody) {
-            apiProps.set("Body", definitionBody.deepCopy());
-        } else if (hasDefinitionUri) {
-            resolveDefinitionUriOrThrow(definitionUri, "BodyS3Location", logicalId, apiProps);
-        }
+        // DefinitionBody nor DefinitionUri is also accepted: measured against real AWS,
+        // us-east-1, create-change-set, it synthesizes a Body of {"swagger": "2.0", "info": {
+        // "version": "1.0", "title": {"Ref": "AWS::StackName"}}, "paths": {}}, while floci emits
+        // no Body and no BodyS3Location for that case. The paths are empty either way, so the
+        // runtime outcome (no method reachable) is the same, even though the stored Body differs.
+        applyDefinitionSource(logicalId, properties, apiProps);
 
         apiDef.set("Properties", apiProps);
         resources.set(logicalId, apiDef);
@@ -1266,13 +1249,37 @@ class SamTransformProcessor {
     }
 
     /**
+     * Resolves a resource's {@code Body} or {@code BodyS3Location} from its {@code DefinitionBody}
+     * or {@code DefinitionUri} properties and sets it on {@code apiProps}, rejecting a resource
+     * that declares both. Shared by {@link #expandServerlessApi} ({@code AWS::ApiGateway::RestApi}'s
+     * {@code Body}/{@code BodyS3Location}) and {@link #expandServerlessHttpApi}
+     * ({@code AWS::ApiGatewayV2::Api}'s {@code Body}/{@code BodyS3Location}): both resource types
+     * accept the identical {@code DefinitionBody}/{@code DefinitionUri} shape and the identical
+     * mutual-exclusion rule.
+     */
+    private void applyDefinitionSource(String logicalId, JsonNode properties, ObjectNode apiProps) {
+        JsonNode definitionBody = properties.path("DefinitionBody");
+        JsonNode definitionUri = properties.path("DefinitionUri");
+        boolean hasDefinitionBody = isPropertyPresent(definitionBody);
+        boolean hasDefinitionUri = isPropertyPresent(definitionUri);
+        rejectBothDefinitionSources(logicalId, "DefinitionUri", "DefinitionBody", hasDefinitionUri && hasDefinitionBody);
+
+        if (hasDefinitionBody) {
+            apiProps.set("Body", definitionBody.deepCopy());
+        } else if (hasDefinitionUri) {
+            resolveDefinitionUriOrThrow(definitionUri, "BodyS3Location", logicalId, apiProps);
+        }
+    }
+
+    /**
      * Rejects a resource that declares both of a pair of mutually exclusive definition-source
      * properties, with AWS's own two-property wording. Shared by {@link #expandServerlessStateMachine}
-     * (for {@code Definition}/{@code DefinitionUri}) and {@link #expandServerlessHttpApi} (for
-     * {@code DefinitionUri}/{@code DefinitionBody}): measured against real AWS, us-east-1,
-     * {@code create-change-set}, both resource types are rejected before a single resource is
-     * provisioned, and each names its two properties in its own order, {@code firstPropertyName}
-     * before {@code secondPropertyName}.
+     * (for {@code Definition}/{@code DefinitionUri}) and {@link #applyDefinitionSource} (for
+     * {@code DefinitionUri}/{@code DefinitionBody}, itself shared by the
+     * {@code AWS::Serverless::Api} and {@code AWS::Serverless::HttpApi} arms): measured against
+     * real AWS, us-east-1, {@code create-change-set}, both resource types are rejected before a
+     * single resource is provisioned, and each names its two properties in its own order,
+     * {@code firstPropertyName} before {@code secondPropertyName}.
      */
     private void rejectBothDefinitionSources(String logicalId, String firstPropertyName,
                                              String secondPropertyName, boolean bothDeclared) {
@@ -1289,7 +1296,8 @@ class SamTransformProcessor {
      * Step Functions {@code DefinitionS3Location} properties both accept. Accepts a textual
      * {@code s3://bucket/key} URI, optionally suffixed with {@code ?versionId=<id>}, or an object
      * form carrying non-null {@code Bucket} and {@code Key} values. Shared by
-     * {@link #expandServerlessHttpApi} (for {@code DefinitionUri} to {@code BodyS3Location}) and
+     * {@link #applyDefinitionSource} (for {@code DefinitionUri} to {@code BodyS3Location}, itself
+     * shared by the {@code AWS::Serverless::Api} and {@code AWS::Serverless::HttpApi} arms) and
      * {@link #expandServerlessStateMachine} (for {@code DefinitionUri} to
      * {@code DefinitionS3Location}); {@link #resolveDefinitionUriOrThrow} is every caller's single
      * entry point, so this predicate for "an S3 location is a literal Bucket and a literal Key"
@@ -1333,8 +1341,9 @@ class SamTransformProcessor {
 
     /**
      * Resolves {@code definitionUri} to a literal Bucket/Key location and sets it on
-     * {@code target.<propertyName>}, or throws when it cannot be resolved. Shared by the
-     * {@code AWS::Serverless::StateMachine} and {@code AWS::Serverless::HttpApi} arms: real AWS
+     * {@code target.<propertyName>}, or throws when it cannot be resolved. Shared by
+     * {@code AWS::Serverless::StateMachine} and {@link #applyDefinitionSource} (itself shared by
+     * the {@code AWS::Serverless::Api} and {@code AWS::Serverless::HttpApi} arms): real AWS
      * (measured against us-east-1 via {@code create-change-set}) rejects every unresolvable
      * {@code DefinitionUri} shape with the same wording on both resource types, before
      * CloudFormation ever sees the resource, so both fail the SAM transform itself rather than
@@ -1342,7 +1351,7 @@ class SamTransformProcessor {
      *
      * <p>Both callers check {@code definitionUri} for presence before calling this method:
      * {@link #expandServerlessStateMachine} only reaches this call once it has rejected the
-     * "neither Definition nor DefinitionUri" and "both" shapes, and {@link #expandServerlessHttpApi}
+     * "neither Definition nor DefinitionUri" and "both" shapes, and {@link #applyDefinitionSource}
      * only reaches it once it knows {@code DefinitionBody} is absent and {@code DefinitionUri} is
      * present. {@code definitionUri} here is therefore always present and non-null.
      */
