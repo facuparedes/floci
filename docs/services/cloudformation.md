@@ -222,6 +222,44 @@ before provisioning:
 The `AWS::SSM::Parameter` **resource** type exposes `Value`, `Type`, and `Name` attributes through
 `Ref` / `Fn::GetAtt` so downstream resources can consume a parameter the same stack creates.
 
+## AWS::Include (`Fn::Transform`)
+
+`Fn::Transform` with `Name: AWS::Include` splices the YAML/JSON snippet at `Parameters.Location`
+into its enclosing mapping before any other intrinsic resolves, on both `CreateStack`/`UpdateStack`
+and the `CreateChangeSet` preview. `Location` must be an `s3://bucket/key` URI: the template
+CloudFormation itself receives always carries one, because `aws cloudformation package` rewrites
+every local path before a stack ever sees it. A `Location` that is not `s3://` fails the stack with
+a `ValidationError` naming it, rather than silently dropping the include. A `Location` that is a
+well-formed `s3://` URI but cannot be read (the bucket or key does not exist) fails the stack with
+the underlying S3 error naming it, for example `NoSuchKey` at HTTP 404, instead of a
+`ValidationError`, since that error is what S3 itself already reports and floci has no more specific
+answer to give.
+
+A snippet may not itself use `AWS::Include`; nesting is rejected rather than expanded or looped.
+`Location` must be a plain string; a `Ref` or another intrinsic in its place is rejected, naming
+the rejected node, rather than resolved.
+
+Four known deviations from AWS:
+
+- The snippet is parsed with floci's CloudFormation-aware YAML parser, so it accepts CloudFormation
+  YAML short tags (`!Ref`, `!Sub`, ...) where AWS's own `AWS::Include` documentation says a snippet
+  does not.
+- floci enforces no `CAPABILITY_AUTO_EXPAND` on a template that declares `AWS::Include`, matching
+  that floci enforces no `CAPABILITY_*` on `CreateStack` today.
+- AWS's own `Fn::Transform` documentation shows a `Location` written as an intrinsic function (its
+  example uses `Ref`) and describes it as accepted; floci does not resolve one and rejects the
+  template instead. This deviation comes from reading AWS's documentation, not from a request
+  measured against a real account.
+- `GetTemplate` accepts no `TemplateStage` request parameter at all, so a caller asking for
+  `TemplateStage=Processed` (the merged/expanded body) is silently answered with `Original` anyway,
+  the same body a default request gets.
+
+`GetTemplateSummary` does not expand the include: it reports `AWS::Include` in the template's
+`Transform`/`DeclaredTransforms` and neither fetches nor validates the snippet, matching AWS.
+`GetTemplate` returns the template exactly as submitted (`Fn::Transform` node and all), matching
+AWS's own `TemplateStage=Original` default; the merged/expanded tree is what a `CreateChangeSet`
+preview diffs against, not what `GetTemplate` returns.
+
 ## Conditions
 
 Template `Conditions` are evaluated before provisioning. A resource whose `Condition` evaluates to
