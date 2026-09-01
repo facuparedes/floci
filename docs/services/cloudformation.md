@@ -239,7 +239,7 @@ A snippet may not itself use `AWS::Include`; nesting is rejected rather than exp
 `Location` must be a plain string; a `Ref` or another intrinsic in its place is rejected, naming
 the rejected node, rather than resolved.
 
-Four known deviations from AWS:
+Three known deviations from AWS:
 
 - The snippet is parsed with floci's CloudFormation-aware YAML parser, so it accepts CloudFormation
   YAML short tags (`!Ref`, `!Sub`, ...) where AWS's own `AWS::Include` documentation says a snippet
@@ -250,15 +250,17 @@ Four known deviations from AWS:
   example uses `Ref`) and describes it as accepted; floci does not resolve one and rejects the
   template instead. This deviation comes from reading AWS's documentation, not from a request
   measured against a real account.
-- `GetTemplate` accepts no `TemplateStage` request parameter at all, so a caller asking for
-  `TemplateStage=Processed` (the merged/expanded body) is silently answered with `Original` anyway,
-  the same body a default request gets.
 
 `GetTemplateSummary` does not expand the include: it reports `AWS::Include` in the template's
 `Transform`/`DeclaredTransforms` and neither fetches nor validates the snippet, matching AWS.
-`GetTemplate` returns the template exactly as submitted (`Fn::Transform` node and all), matching
-AWS's own `TemplateStage=Original` default; the merged/expanded tree is what a `CreateChangeSet`
-preview diffs against, not what `GetTemplate` returns.
+`GetTemplate` accepts `TemplateStage` (`Original`, the default, or `Processed`) and validates it
+against that enum, rejecting anything else with a `ValidationError` naming the value, matching AWS.
+`Original` returns the template exactly as submitted (`Fn::Transform` node and all); `Processed`
+returns the merged/SAM-expanded tree that a `CreateChangeSet` preview also diffs against. A
+`Transform` floci does not expand (a third-party macro, `AWS::LanguageExtensions`) leaves
+`Processed` holding the unexpanded body, since `executeTemplate` only re-serializes the template
+for SAM and `AWS::Include`; real AWS's answer for that case has not been measured against a real
+account. `StagesAvailable` always lists both stages, matching AWS.
 
 ## Conditions
 

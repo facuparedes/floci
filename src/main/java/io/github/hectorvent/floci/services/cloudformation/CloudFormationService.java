@@ -582,17 +582,41 @@ public class CloudFormationService implements ResourceProvider {
 
     // ── GetTemplate ───────────────────────────────────────────────────────────
 
-    public String getTemplate(String stackName, String region) {
+    // AWS's own enum order for the ValidationError message (measured against a real account).
+    private static final List<String> TEMPLATE_STAGE_ENUM = List.of("Processed", "Original");
+    // AWS's own StagesAvailable order (Original first), which every GetTemplate call reports.
+    private static final List<String> TEMPLATE_STAGES_AVAILABLE = List.of("Original", "Processed");
+
+    public String getTemplate(String stackName, String templateStage, String region) {
         Stack stack = getStackOrThrow(stackName, region);
-        // Real GetTemplate defaults to TemplateStage=Original and returns the template exactly as
-        // the caller submitted it, not the SAM/AWS::Include-expanded form templateBody holds after
-        // executeTemplate. originalTemplateBody is only absent for stacks persisted by a floci
-        // version predating this field, hence the fallback. getTemplateSummary reads the same field
-        // for the same reason.
-        if (stack.getOriginalTemplateBody() != null) {
-            return stack.getOriginalTemplateBody();
+        String stage = validateTemplateStage(templateStage);
+        // Processed is the SAM/AWS::Include-expanded form templateBody holds after executeTemplate.
+        // Original (also the default, matching real AWS) is the template exactly as the caller
+        // submitted it. originalTemplateBody is only absent for stacks persisted by a floci version
+        // predating this field, hence the fallback to templateBody; getTemplateSummary reads the
+        // same field for the same reason.
+        String body = "Processed".equals(stage) ? stack.getTemplateBody() : stack.getOriginalTemplateBody();
+        if (body == null) {
+            body = stack.getTemplateBody();
         }
-        return stack.getTemplateBody() != null ? stack.getTemplateBody() : "{}";
+        return body != null ? body : "{}";
+    }
+
+    private String validateTemplateStage(String templateStage) {
+        if (templateStage == null || templateStage.isBlank()) {
+            return "Original";
+        }
+        if (!TEMPLATE_STAGE_ENUM.contains(templateStage)) {
+            throw new AwsException("ValidationError",
+                    "1 validation error detected: Value '" + templateStage + "' at 'templateStage' failed to "
+                            + "satisfy constraint: Member must satisfy enum value set: ["
+                            + String.join(", ", TEMPLATE_STAGE_ENUM) + "]", 400);
+        }
+        return templateStage;
+    }
+
+    public List<String> templateStagesAvailable() {
+        return TEMPLATE_STAGES_AVAILABLE;
     }
 
     // ── GetTemplateSummary ────────────────────────────────────────────────────
