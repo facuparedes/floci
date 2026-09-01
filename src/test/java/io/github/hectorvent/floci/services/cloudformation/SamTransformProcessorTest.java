@@ -613,6 +613,36 @@ class SamTransformProcessorTest {
     }
 
     @Test
+    void expandSamTemplate_apiWithBothDefinitionBodyAndDefinitionUriIsRejected() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyApi": {
+                  "Type": "AWS::Serverless::Api",
+                  "Properties": {
+                    "DefinitionBody": { "openapi": "3.0.1", "paths": {} },
+                    "DefinitionUri": "s3://api-specs/openapi.yaml"
+                  }
+                }
+              }
+            }
+            """);
+
+        AwsException exception = assertThrows(AwsException.class,
+                () -> processor.expandSamTemplate(template));
+
+        // Measured against real AWS, us-east-1, create-change-set: an Api declaring both
+        // DefinitionBody and DefinitionUri is rejected, DefinitionUri named first, the same
+        // order as the equivalent HttpApi message. floci must not silently prefer DefinitionBody
+        // and emit Body with no error.
+        assertEquals("ValidationError", exception.getErrorCode());
+        assertEquals("Resource with id [MyApi] is invalid. Specify either 'DefinitionUri' "
+                        + "or 'DefinitionBody' property and not both.",
+                exception.getMessage());
+    }
+
+    @Test
     void expandSamTemplate_apiWithLocalDefinitionUriIsRejected() throws Exception {
         JsonNode template = objectMapper.readTree("""
             {
