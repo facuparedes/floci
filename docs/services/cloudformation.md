@@ -255,13 +255,20 @@ Three known deviations from AWS:
 `Transform`/`DeclaredTransforms` and neither fetches nor validates the snippet, matching AWS.
 `GetTemplate` accepts `TemplateStage` (`Original`, the default, or `Processed`) and validates it
 against that enum, rejecting anything else with a `ValidationError` naming the value, matching AWS.
-`Original` returns the template exactly as submitted (`Fn::Transform` node and all); `Processed`
-returns the merged/SAM-expanded tree that a `CreateChangeSet` preview also diffs against. A
-third-party macro, `AWS::LanguageExtensions`, and the top-level `Transform: {Name: AWS::Include,
-Parameters: {Location: ...}}` form (which floci never splices) all leave `Processed` holding the
-unexpanded body, since `executeTemplate` only re-serializes the template for SAM and the embedded
-`Fn::Transform`/`AWS::Include` form described above. Real AWS's answer for any of these cases is
-unmeasured. `StagesAvailable` always lists both stages, matching AWS.
+`Original` returns the template exactly as submitted, `Fn::Transform` node and all. `Processed`
+returns the merged and SAM-expanded tree, the same one a `CreateChangeSet` preview diffs against.
+
+floci expands neither `AWS::LanguageExtensions`, nor a third-party macro, nor the top-level
+`Transform: {Name: AWS::Include, Parameters: {Location: ...}}` form. A template carrying only one of
+those three keeps `Processed` equal to `Original`, byte for byte.
+
+Two triggers break that equality, because `executeTemplate` re-serializes the persisted body when
+either one fires: an embedded `Fn::Transform` that merges, and a SAM transform. A SAM transform goes
+further, because `SamTransformProcessor` removes the whole `Transform` section unconditionally, so a
+macro co-declared beside SAM is absent from `Processed` as well.
+
+Real AWS's answer for these shapes is unmeasured, co-declared with SAM or not. `StagesAvailable`
+always lists both stages, matching AWS.
 
 ## Conditions
 

@@ -582,8 +582,6 @@ public class CloudFormationService implements ResourceProvider {
 
     // ── GetTemplate ───────────────────────────────────────────────────────────
 
-    // The two GetTemplate stages, named once so the ValidationError enum list, the
-    // StagesAvailable list, the stage-selection check and the default below cannot diverge.
     private static final String STAGE_PROCESSED = "Processed";
     private static final String STAGE_ORIGINAL = "Original";
 
