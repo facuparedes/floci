@@ -1160,18 +1160,24 @@ class SamTransformProcessor {
         JsonNode definitionUri = properties.path("DefinitionUri");
         if (!definitionUri.isMissingNode() && !definitionUri.isNull()) {
             ObjectNode s3Location = samUriToS3Location(definitionUri);
-            if (s3Location != null) {
+            boolean resolvedS3Location = s3Location != null
+                    && s3Location.has("Bucket") && s3Location.has("Key");
+            if (resolvedS3Location) {
                 smProps.set("DefinitionS3Location", s3Location);
-            } else if (definitionUri.isTextual()) {
-                // Real SAM rejects the same shape the same way: a DefinitionUri that is not a
-                // packaged 's3://bucket/key' reference (a local path, or an s3:// value with no
-                // key) fails the transform itself, before CloudFormation ever sees the resource.
-                // Failing here beats today's silent CREATE_COMPLETE with a stub ARN.
+            } else if (definitionUri.isTextual() || s3Location != null) {
+                // Real SAM rejects both shapes the same way: a DefinitionUri that never resolves
+                // to a literal Bucket/Key (a local path, an s3:// value with no key, or an object
+                // form such as an intrinsic expression that samUriToS3Location passes through
+                // unresolved) fails the transform itself, before CloudFormation ever sees the
+                // resource. Failing here beats today's silent CREATE_COMPLETE with a stub ARN,
+                // and beats the "DefinitionS3Location requires Bucket and Key" that
+                // CloudFormationResourceProvisioner throws only once provisioning starts.
+                String reason = definitionUri.isTextual()
+                        ? "'DefinitionUri' is not a valid S3 Uri of the form 's3://bucket/key' "
+                                + "with optional versionId query parameter."
+                        : "'DefinitionUri' requires Bucket and Key properties to be specified.";
                 throw new AwsException("ValidationError",
-                        "Resource with id [" + logicalId + "] is invalid. 'DefinitionUri' is not "
-                                + "a valid S3 Uri of the form 's3://bucket/key' with optional "
-                                + "versionId query parameter.",
-                        400);
+                        "Resource with id [" + logicalId + "] is invalid. " + reason, 400);
             }
         }
 

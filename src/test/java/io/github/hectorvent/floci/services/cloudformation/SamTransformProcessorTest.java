@@ -1363,6 +1363,35 @@ class SamTransformProcessorTest {
     }
 
     @Test
+    void expandSamTemplate_stateMachineWithObjectDefinitionUriMissingKeyIsRejected() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Properties": {
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "DefinitionUri": { "Bucket": "asl-definitions" }
+                  }
+                }
+              }
+            }
+            """);
+
+        AwsException exception = assertThrows(AwsException.class,
+                () -> processor.expandSamTemplate(template));
+
+        // An object DefinitionUri that names Bucket but not Key must be rejected the same way as
+        // one that names neither: only a Bucket-and-Key pair resolves to a location the native
+        // DefinitionS3Location property accepts.
+        assertEquals("ValidationError", exception.getErrorCode());
+        assertEquals("Resource with id [OrdersStateMachine] is invalid. 'DefinitionUri' requires "
+                        + "Bucket and Key properties to be specified.",
+                exception.getMessage());
+    }
+
+    @Test
     void expandSamTemplate_stateMachineWithVersionedDefinitionUriSplitsVersion() throws Exception {
         JsonNode template = objectMapper.readTree("""
             {
@@ -1529,31 +1558,6 @@ class SamTransformProcessorTest {
         assertTrue(environmentTag.path("Value").isObject(),
                 "an intrinsic tag value must survive as an object, not be stringified");
         assertEquals("Environment", environmentTag.path("Value").path("Ref").asText());
-    }
-
-    @Test
-    void expandSamTemplate_stateMachineWithIntrinsicDefinitionUri() throws Exception {
-        JsonNode template = objectMapper.readTree("""
-            {
-              "Transform": "AWS::Serverless-2016-10-31",
-              "Resources": {
-                "OrdersStateMachine": {
-                  "Type": "AWS::Serverless::StateMachine",
-                  "Properties": {
-                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
-                    "DefinitionUri": { "Fn::Sub": "s3://${SpecBucket}/orders.asl.json" }
-                  }
-                }
-              }
-            }
-            """);
-
-        JsonNode definitionS3Location = processor.expandSamTemplate(template)
-                .path("Resources").path("OrdersStateMachine").path("Properties").path("DefinitionS3Location");
-
-        assertEquals("s3://${SpecBucket}/orders.asl.json", definitionS3Location.path("Fn::Sub").asText(),
-                "an intrinsic DefinitionUri cannot be split and must pass through unsplit, "
-                        + "not be rejected by the local-path guard, which fires on textual values only");
     }
 
     @Test
