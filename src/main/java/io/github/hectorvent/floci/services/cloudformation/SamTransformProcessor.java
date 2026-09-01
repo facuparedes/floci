@@ -1140,9 +1140,8 @@ class SamTransformProcessor {
      * CloudFormation itself carries a transformed resource's own attributes through.
      *
      * <p>Does not handle {@code Events}, {@code Policies}, {@code PermissionsBoundary},
-     * {@code AutoPublishAlias} or {@code UseAliasAsEventTarget}: none appears in a corpus of 174
-     * {@code AWS::Serverless::StateMachine} declarations across 20 source repositories measured
-     * against real AWS.
+     * {@code AutoPublishAlias} or {@code UseAliasAsEventTarget}: none appeared in the
+     * {@code AWS::Serverless::StateMachine} declarations measured against real AWS.
      */
     private void expandServerlessStateMachine(String logicalId, JsonNode samResource, ObjectNode resources) {
         resources.remove(logicalId);
