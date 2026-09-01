@@ -365,4 +365,23 @@ class AwsIncludeProcessorTest {
                         + "first include and stops would leave this unset: substitutions are " + second);
         assertFalse(second.has("Fn::Transform"));
     }
+
+    @Test
+    void blankLocationRendersItsQuotedEmptyStringInsteadOfLeavingAnEmptyTail() {
+        String template = """
+            Resources:
+              OrdersStateMachine:
+                Type: AWS::StepFunctions::StateMachine
+                Properties:
+                  DefinitionSubstitutions:
+                    Fn::Transform:
+                      Name: AWS::Include
+                      Parameters:
+                        Location: ""
+            """;
+
+        AwsException e = assertThrows(AwsException.class, () -> mergedSubstitutions(template));
+        assertEquals("Fn::Transform AWS::Include Location must be an s3://bucket/key URI, "
+                + "got \"\"", e.getMessage());
+    }
 }
