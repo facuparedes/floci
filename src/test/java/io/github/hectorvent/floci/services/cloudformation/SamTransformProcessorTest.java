@@ -1612,7 +1612,8 @@ class SamTransformProcessorTest {
                   "Metadata": { "SamResourceId": "OrdersStateMachine" },
                   "DependsOn": "OrdersRole",
                   "Properties": {
-                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role"
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "DefinitionUri": "s3://asl-definitions/orders.asl.json"
                   }
                 }
               }
@@ -1646,7 +1647,8 @@ class SamTransformProcessorTest {
                   "Type": "AWS::Serverless::StateMachine",
                   "Properties": {
                     "Name": { "Fn::Sub": "${Environment}-orders-sm" },
-                    "Role": { "Fn::GetAtt": ["OrdersRole", "Arn"] }
+                    "Role": { "Fn::GetAtt": ["OrdersRole", "Arn"] },
+                    "DefinitionUri": "s3://asl-definitions/orders.asl.json"
                   }
                 }
               }
@@ -1679,6 +1681,7 @@ class SamTransformProcessorTest {
                   "Type": "AWS::Serverless::StateMachine",
                   "Properties": {
                     "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "DefinitionUri": "s3://asl-definitions/orders.asl.json",
                     "Tags": {}
                   }
                 }
@@ -1705,6 +1708,7 @@ class SamTransformProcessorTest {
                   "Type": "AWS::Serverless::StateMachine",
                   "Properties": {
                     "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "DefinitionUri": "s3://asl-definitions/orders.asl.json",
                     "Tags": {
                       "project-id": 12345678,
                       "environment": { "Ref": "Environment" }

@@ -236,6 +236,12 @@ class SamTransformProcessor {
                                          List<HttpApiRoute> allRoutes, ObjectNode resources) {
         resources.remove(logicalId);
 
+        JsonNode definitionBody = properties.path("DefinitionBody");
+        JsonNode definitionUri = properties.path("DefinitionUri");
+        boolean hasDefinitionBody = isPropertyPresent(definitionBody);
+        boolean hasDefinitionUri = isPropertyPresent(definitionUri);
+        rejectBothDefinitionSources(logicalId, "DefinitionUri", hasDefinitionUri, "DefinitionBody", hasDefinitionBody);
+
         ObjectNode apiDef = objectMapper.createObjectNode();
         apiDef.put("Type", "AWS::ApiGatewayV2::Api");
         ObjectNode apiProps = objectMapper.createObjectNode();
@@ -245,12 +251,14 @@ class SamTransformProcessor {
         copyIfPresent(properties, "Description", apiProps);
 
         // Preserve inline OpenAPI route definitions so the ApiGatewayV2 provisioner can
-        // materialize the routes and integrations declared by SAM DefinitionBody.
-        JsonNode definitionBody = properties.path("DefinitionBody");
-        if (!definitionBody.isMissingNode() && !definitionBody.isNull()) {
+        // materialize the routes and integrations declared by SAM DefinitionBody. Neither
+        // DefinitionBody nor DefinitionUri is accepted too: measured against real AWS, us-east-1,
+        // create-change-set, an HttpApi declaring neither still expands to an
+        // AWS::ApiGatewayV2::Api and its default stage, carrying no Body and no BodyS3Location.
+        if (hasDefinitionBody) {
             apiProps.set("Body", definitionBody.deepCopy());
-        } else {
-            applyDefinitionUri(properties.path("DefinitionUri"), "BodyS3Location", logicalId, apiProps);
+        } else if (hasDefinitionUri) {
+            resolveDefinitionUriOrThrow(definitionUri, "BodyS3Location", logicalId, apiProps);
         }
         apiDef.set("Properties", apiProps);
         resources.set(logicalId, apiDef);
@@ -1141,6 +1149,17 @@ class SamTransformProcessor {
         resources.remove(logicalId);
         JsonNode properties = samResource.path("Properties");
 
+        JsonNode definition = properties.path("Definition");
+        JsonNode definitionUri = properties.path("DefinitionUri");
+        boolean hasDefinition = isPropertyPresent(definition);
+        boolean hasDefinitionUri = isPropertyPresent(definitionUri);
+        rejectBothDefinitionSources(logicalId, "Definition", hasDefinition, "DefinitionUri", hasDefinitionUri);
+        if (!hasDefinition && !hasDefinitionUri) {
+            throw new AwsException("ValidationError",
+                    "Resource with id [" + logicalId + "] is invalid. Either 'Definition' or "
+                            + "'DefinitionUri' property must be specified.", 400);
+        }
+
         ObjectNode stateMachineDef = objectMapper.createObjectNode();
         stateMachineDef.put("Type", "AWS::StepFunctions::StateMachine");
         copyResourceLevelAttributes(samResource, stateMachineDef);
@@ -1152,9 +1171,11 @@ class SamTransformProcessor {
         copyRenamed(properties, "Logging", smProps, "LoggingConfiguration");
         copyRenamed(properties, "Tracing", smProps, "TracingConfiguration");
         copyIfPresent(properties, "DefinitionSubstitutions", smProps);
-        copyIfPresent(properties, "Definition", smProps);
-
-        applyDefinitionUri(properties.path("DefinitionUri"), "DefinitionS3Location", logicalId, smProps);
+        if (hasDefinition) {
+            copyIfPresent(properties, "Definition", smProps);
+        } else {
+            resolveDefinitionUriOrThrow(definitionUri, "DefinitionS3Location", logicalId, smProps);
+        }
 
         smProps.set("Tags", samTagsToCfnTags(properties.path("Tags")));
 
@@ -1223,6 +1244,29 @@ class SamTransformProcessor {
         }
     }
 
+    /** True when {@code value} is neither an absent property nor an explicit JSON null. */
+    private boolean isPropertyPresent(JsonNode value) {
+        return !value.isMissingNode() && !value.isNull();
+    }
+
+    /**
+     * Rejects a resource that declares both of a pair of mutually exclusive definition-source
+     * properties, with AWS's own two-property wording. Shared by {@link #expandServerlessStateMachine}
+     * (for {@code Definition}/{@code DefinitionUri}) and {@link #expandServerlessHttpApi} (for
+     * {@code DefinitionUri}/{@code DefinitionBody}): measured against real AWS, us-east-1,
+     * {@code create-change-set}, both resource types are rejected before a single resource is
+     * provisioned, and each names its two properties in its own order, {@code firstPropertyName}
+     * before {@code secondPropertyName}.
+     */
+    private void rejectBothDefinitionSources(String logicalId, String firstPropertyName, boolean hasFirst,
+                                              String secondPropertyName, boolean hasSecond) {
+        if (hasFirst && hasSecond) {
+            throw new AwsException("ValidationError",
+                    "Resource with id [" + logicalId + "] is invalid. Specify either '" + firstPropertyName
+                            + "' or '" + secondPropertyName + "' property and not both.", 400);
+        }
+    }
+
     /**
      * Splits a SAM {@code *Uri} property into the literal {@code {Bucket, Key}} (or
      * {@code {Bucket, Key, Version}}) shape the native ApiGatewayV2 {@code BodyS3Location} and
@@ -1231,9 +1275,9 @@ class SamTransformProcessor {
      * form carrying non-null {@code Bucket} and {@code Key} values. Shared by
      * {@link #expandServerlessHttpApi} (for {@code DefinitionUri} to {@code BodyS3Location}) and
      * {@link #expandServerlessStateMachine} (for {@code DefinitionUri} to
-     * {@code DefinitionS3Location}); {@link #applyDefinitionUri} is every caller's single entry
-     * point, so this predicate for "an S3 location is a literal Bucket and a literal Key" lives
-     * here once.
+     * {@code DefinitionS3Location}); {@link #resolveDefinitionUriOrThrow} is every caller's single
+     * entry point, so this predicate for "an S3 location is a literal Bucket and a literal Key"
+     * lives here once.
      *
      * <p>Returns {@code null} whenever the value cannot be resolved to a literal Bucket and Key:
      * an absent or null property; a textual value that is not a valid {@code s3://bucket/key}
@@ -1242,14 +1286,11 @@ class SamTransformProcessor {
      * value parses this way); or a value of any other JSON type (array, number, boolean). An
      * object whose {@code Bucket}/{@code Key} is itself an unresolved intrinsic (for example
      * {@code Ref} or {@code Fn::Sub}) is not distinguished from one carrying a literal value
-     * here: {@link #applyDefinitionUri} only calls this method for the top-level
+     * here: {@link #resolveDefinitionUriOrThrow} only calls this method for the top-level
      * {@code DefinitionUri} node, and an intrinsic at that level (rather than nested inside
      * {@code Bucket}/{@code Key}) is the shape measured against real AWS and rejected.
      */
     private ObjectNode samUriToS3Location(JsonNode definitionUri) {
-        if (definitionUri == null || definitionUri.isMissingNode() || definitionUri.isNull()) {
-            return null;
-        }
         if (definitionUri.isTextual()) {
             Matcher matcher = S3_DEFINITION_URI.matcher(definitionUri.asText());
             if (!matcher.matches()) {
@@ -1283,40 +1324,30 @@ class SamTransformProcessor {
      * CloudFormation ever sees the resource, so both fail the SAM transform itself rather than
      * reaching provisioning with no usable definition.
      *
-     * <p>An absent or null {@code definitionUri} is left alone: SAM allows the definition to come
-     * from a sibling property instead ({@code Definition}/{@code DefinitionString} for a state
-     * machine, an inline {@code DefinitionBody} for an HttpApi), and the caller has already
-     * checked for those before calling this method.
+     * <p>Both callers check {@code definitionUri} for presence before calling this method:
+     * {@link #expandServerlessStateMachine} only reaches this call once it has rejected the
+     * "neither Definition nor DefinitionUri" and "both" shapes, and {@link #expandServerlessHttpApi}
+     * only reaches it once it knows {@code DefinitionBody} is absent and {@code DefinitionUri} is
+     * present. {@code definitionUri} here is therefore always present and non-null.
      */
-    private void applyDefinitionUri(JsonNode definitionUri, String propertyName, String logicalId, ObjectNode target) {
-        if (definitionUri.isMissingNode() || definitionUri.isNull()) {
-            return;
-        }
+    private void resolveDefinitionUriOrThrow(JsonNode definitionUri, String propertyName, String logicalId,
+                                              ObjectNode target) {
         ObjectNode s3Location = samUriToS3Location(definitionUri);
         if (s3Location != null) {
             target.set(propertyName, s3Location);
             return;
         }
-        throw new AwsException("ValidationError",
-                "Resource with id [" + logicalId + "] is invalid. "
-                        + definitionUriRejectionReason(definitionUri), 400);
-    }
-
-    /**
-     * Selects the AWS wording for a {@code DefinitionUri} {@link #samUriToS3Location} could not
-     * resolve. Measured against real AWS, us-east-1, {@code create-change-set}: the wording
-     * depends only on the JSON shape of {@code DefinitionUri}, not on which resource type it
-     * appears on.
-     */
-    private String definitionUriRejectionReason(JsonNode definitionUri) {
+        String reason;
         if (definitionUri.isTextual()) {
-            return "'DefinitionUri' is not a valid S3 Uri of the form 's3://bucket/key' "
+            reason = "'DefinitionUri' is not a valid S3 Uri of the form 's3://bucket/key' "
                     + "with optional versionId query parameter.";
+        } else if (definitionUri.isObject()) {
+            reason = "'DefinitionUri' requires Bucket and Key properties to be specified.";
+        } else {
+            reason = "Type of property 'DefinitionUri' is invalid.";
         }
-        if (definitionUri.isObject()) {
-            return "'DefinitionUri' requires Bucket and Key properties to be specified.";
-        }
-        return "Type of property 'DefinitionUri' is invalid.";
+        throw new AwsException("ValidationError",
+                "Resource with id [" + logicalId + "] is invalid. " + reason, 400);
     }
 
     /** Copies {@code source.<field>} to {@code target.<field>} when present and non-null. */
