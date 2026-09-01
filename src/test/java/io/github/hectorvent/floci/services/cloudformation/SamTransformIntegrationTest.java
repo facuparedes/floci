@@ -608,28 +608,16 @@ class SamTransformIntegrationTest {
     }
 
     @Test
-    void samHttpApi_intrinsicDefinitionUriCreatesApiGatewayV2Routes() {
+    void samHttpApi_intrinsicDefinitionUriIsRejected() {
+        // Real AWS (measured against us-east-1 via create-change-set) rejects an HttpApi
+        // DefinitionUri that never resolves to a literal Bucket/Key the same way it rejects that
+        // shape on a StateMachine: expandServerlessHttpApi shares the DefinitionUri guard with
+        // expandServerlessStateMachine, so the transform fails before a single resource is
+        // provisioned, rather than importing the intrinsic as an unusable BodyS3Location.
         String suffix = Long.toString(System.nanoTime(), 36);
         String stackName = "sam-http-api-uri-" + suffix;
         String apiName = "sam-http-api-uri-" + suffix;
-        String bucketName = "sam-http-api-spec-" + suffix;
         stacksToDelete.add(stackName);
-
-        given()
-        .when()
-            .put("/" + bucketName)
-        .then()
-            .statusCode(200);
-
-        given()
-            .contentType("application/json")
-            .body("""
-                {"openapi":"3.0.1","paths":{"/from-uri":{"get":{}}}}
-                """)
-        .when()
-            .put("/" + bucketName + "/openapi.json")
-        .then()
-            .statusCode(200);
 
         String template = """
             AWSTemplateFormatVersion: '2010-09-09'
@@ -640,8 +628,8 @@ class SamTransformIntegrationTest {
                 Properties:
                   Name: %s
                   DefinitionUri:
-                    Fn::Sub: s3://%s/openapi.json
-            """.formatted(apiName, bucketName);
+                    Fn::Sub: s3://${SpecBucket}/openapi.json
+            """.formatted(apiName);
 
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -651,17 +639,25 @@ class SamTransformIntegrationTest {
         .when()
             .post("/")
         .then()
-            .statusCode(200);
+            .statusCode(200)
+            .body(containsString("<StackId>"));
 
-        waitForStackStatus(stackName, "CREATE_COMPLETE");
+        waitForStackStatus(stackName, "CREATE_FAILED");
 
-        String apiId = apiIdForName(apiName);
         given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
         .when()
-            .get("/v2/apis/" + apiId + "/routes")
+            .post("/")
         .then()
             .statusCode(200)
-            .body("items.routeKey", hasItem("GET /from-uri"));
+            .body(not(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>")))
+            // XmlBuilder.elem escapes the single quotes AWS's own wording uses around
+            // 'DefinitionUri' to &apos;.
+            .body(containsString("Resource with id [HttpApi] is invalid. "
+                    + "&apos;DefinitionUri&apos; requires Bucket and Key properties to be "
+                    + "specified."));
     }
 
     @Test
