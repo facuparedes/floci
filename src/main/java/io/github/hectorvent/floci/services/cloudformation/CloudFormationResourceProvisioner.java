@@ -4836,6 +4836,20 @@ public class CloudFormationResourceProvisioner {
         var api = apiGatewayService.createRestApi(region, req);
         r.setPhysicalId(api.getId());
         r.getAttributes().put("RootResourceId", apiGatewayService.getResources(region, api.getId()).get(0).getId());
+
+        // A declared Body or BodyS3Location is the whole OpenAPI document: measured against real
+        // AWS, us-east-1, create-change-set, it becomes the RestApi's Body with no synthesized
+        // AWS::ApiGateway::Resource or AWS::ApiGateway::Method, so the working OpenAPI
+        // materializer (putRestApi + applyOpenApiSpec) is the only place that turns it into
+        // resources and methods. putRestApi also overwrites the API's name and description from
+        // the document's info, which real AWS does not do: the declared Name always wins, so
+        // the resolved name is re-applied immediately after.
+        JsonNode openApiDocument = resolveRestApiOpenApiDocument(props, engine);
+        if (openApiDocument != null) {
+            apiGatewayService.putRestApi(region, api.getId(), "overwrite", openApiDocument.toString());
+            apiGatewayService.updateRestApi(region, api.getId(),
+                    List.of(Map.of("op", "replace", "path", "/name", "value", name)));
+        }
     }
 
     private void provisionApiGatewayResource(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
@@ -4977,7 +4991,7 @@ public class CloudFormationResourceProvisioner {
      */
     private void reconcileApiGatewayV2BodyRoutes(StackResource r, String region, String apiId, JsonNode props,
                                                  CloudFormationTemplateEngine engine) {
-        JsonNode body = resolveApiGatewayV2OpenApiBody(props, engine);
+        JsonNode body = resolveRestApiOpenApiDocument(props, engine);
         ApiGatewayV2BodyResourceState previous = null;
         try {
             previous = snapshotApiGatewayV2BodyResources(r, region, apiId);
@@ -5013,7 +5027,7 @@ public class CloudFormationResourceProvisioner {
                 replacement.authorizerIds());
     }
 
-    private JsonNode resolveApiGatewayV2OpenApiBody(JsonNode props, CloudFormationTemplateEngine engine) {
+    private JsonNode resolveRestApiOpenApiDocument(JsonNode props, CloudFormationTemplateEngine engine) {
         if (props == null) {
             return null;
         }
@@ -5025,7 +5039,7 @@ public class CloudFormationResourceProvisioner {
         }
 
         JsonNode location = engine.resolveNode(props.get("BodyS3Location"));
-        ApiGatewayV2BodyS3Location bodyS3Location = parseApiGatewayV2BodyS3Location(location);
+        ApiGatewayV2BodyS3Location bodyS3Location = parseOpenApiBodyS3Location(location);
 
         try {
             byte[] document = s3Service.getObject(bodyS3Location.bucket(), bodyS3Location.key(),
@@ -5044,7 +5058,7 @@ public class CloudFormationResourceProvisioner {
         }
     }
 
-    private ApiGatewayV2BodyS3Location parseApiGatewayV2BodyS3Location(JsonNode location) {
+    private ApiGatewayV2BodyS3Location parseOpenApiBodyS3Location(JsonNode location) {
         if (location != null && location.isTextual()) {
             String uri = location.asText();
             if (uri.startsWith("s3://")) {

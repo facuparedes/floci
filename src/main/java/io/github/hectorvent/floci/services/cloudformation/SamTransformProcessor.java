@@ -1089,6 +1089,22 @@ class SamTransformProcessor {
         }
         copyIfPresent(properties, "Description", apiProps);
 
+        JsonNode definitionBody = properties.path("DefinitionBody");
+        JsonNode definitionUri = properties.path("DefinitionUri");
+        boolean hasDefinitionBody = isPropertyPresent(definitionBody);
+        boolean hasDefinitionUri = isPropertyPresent(definitionUri);
+        rejectBothDefinitionSources(logicalId, "DefinitionUri", "DefinitionBody", hasDefinitionUri && hasDefinitionBody);
+
+        // Preserve the inline OpenAPI document so the REST API provisioner can materialize the
+        // resources and methods declared by SAM DefinitionBody. An Api declaring neither
+        // DefinitionBody nor DefinitionUri is also accepted, and behaves exactly as before: no
+        // Body and no BodyS3Location.
+        if (hasDefinitionBody) {
+            apiProps.set("Body", definitionBody.deepCopy());
+        } else if (hasDefinitionUri) {
+            resolveDefinitionUriOrThrow(definitionUri, "BodyS3Location", logicalId, apiProps);
+        }
+
         apiDef.set("Properties", apiProps);
         resources.set(logicalId, apiDef);
 
