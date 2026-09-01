@@ -4821,9 +4821,10 @@ public class CloudFormationResourceProvisioner {
         if (name == null || name.isBlank()) {
             name = generatePhysicalName(stackName, r.getLogicalId(), 255, false);
         }
+        String description = resolveOptional(props, "Description", engine);
         Map<String, Object> req = new HashMap<>();
         req.put("name", name);
-        req.put("description", resolveOptional(props, "Description", engine));
+        req.put("description", description);
 
         if (props.has("EndpointConfiguration")) {
             JsonNode epNode = props.get("EndpointConfiguration");
@@ -4841,15 +4842,30 @@ public class CloudFormationResourceProvisioner {
         // AWS, us-east-1, create-change-set, it becomes the RestApi's Body with no synthesized
         // AWS::ApiGateway::Resource or AWS::ApiGateway::Method, so the working OpenAPI
         // materializer (putRestApi + applyOpenApiSpec) is the only place that turns it into
-        // resources and methods. putRestApi also overwrites the API's name and description from
-        // the document's info, which real AWS does not do: the declared Name always wins, so
-        // the resolved name is re-applied immediately after.
+        // resources and methods. The same probe's processed template keeps a declared Name and
+        // Description in their own properties even when Body.info carries a different title or
+        // description, but putRestApi overwrites both from the document's info, so the resolved
+        // Name and Description (null when Description is undeclared, clearing what putRestApi
+        // just set) are re-applied immediately after.
         JsonNode openApiDocument = resolveOpenApiDocument(props, engine);
         if (openApiDocument != null) {
             apiGatewayService.putRestApi(region, api.getId(), "overwrite", openApiDocument.toString());
             apiGatewayService.updateRestApi(region, api.getId(),
-                    List.of(Map.of("op", "replace", "path", "/name", "value", name)));
+                    List.of(replacePatchOp("/name", name), replacePatchOp("/description", description)));
         }
+    }
+
+    /**
+     * A {@code replace} patch operation for {@link ApiGatewayService#updateRestApi}, allowing a
+     * {@code null} value ({@code Map.of} rejects one) so an undeclared property can still be
+     * cleared rather than left at whatever {@code putRestApi} last wrote to it.
+     */
+    private Map<String, String> replacePatchOp(String path, String value) {
+        Map<String, String> op = new HashMap<>();
+        op.put("op", "replace");
+        op.put("path", path);
+        op.put("value", value);
+        return op;
     }
 
     private void provisionApiGatewayResource(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
