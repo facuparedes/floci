@@ -472,6 +472,76 @@ class AwsIncludeIntegrationTest {
     }
 
     @Test
+    void getTemplateWithInvalidStageValidatesBeforeCheckingWhetherTheStackExists() {
+        // Verbatim against real AWS (measured on us-east-1): `--template-stage Bogus` against a
+        // stack name that was never created still answers with the enum ValidationError, not
+        // "Stack with id ... does not exist", proving AWS validates the request shape before it
+        // looks the stack up. This stack name is never created here, on purpose: a test that
+        // creates the stack first (like the one above) cannot tell this ordering apart from
+        // floci validating after a successful lookup.
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "aws-include-stage-bogus-no-stack-" + suffix;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetTemplate")
+            .formParam("StackName", stackName)
+            .formParam("TemplateStage", "Bogus")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>ValidationError</Code>"))
+            .body(containsString("Value &apos;Bogus&apos; at &apos;templateStage&apos; failed to satisfy "
+                    + "constraint: Member must satisfy enum value set: [Processed, Original]"))
+            .body(not(containsString("does not exist")));
+    }
+
+    @Test
+    void getTemplateWithEmptyStringStageRejectsWithTheAwsEnumValidationError() {
+        // Verbatim against real AWS (measured on us-east-1): `--template-stage ""` is rejected the
+        // same as any other value outside the enum. params.getFirst("TemplateStage") returns "" for
+        // this request, distinct from the omitted case (null), which defaults to Original.
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "aws-include-stage-empty-stack-" + suffix;
+        String parameterName = "/aws-include-it/stage-empty-" + suffix;
+        stacksToDelete.add(stackName);
+
+        String template = """
+            Resources:
+              EmptyStageParam:
+                Type: AWS::SSM::Parameter
+                Properties:
+                  Name: %s
+                  Type: String
+                  Value: plain-value
+            """.formatted(parameterName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetTemplate")
+            .formParam("StackName", stackName)
+            .formParam("TemplateStage", "")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>ValidationError</Code>"))
+            .body(containsString("Value &apos;&apos; at &apos;templateStage&apos; failed to satisfy "
+                    + "constraint: Member must satisfy enum value set: [Processed, Original]"));
+    }
+
+    @Test
     void getTemplateOnAPlainStackReturnsIdenticalBodiesAcrossStagesAndAdvertisesBothInStagesAvailable() {
         // No transform at all: real AWS still accepts TemplateStage on a plain stack and returns
         // the identical body for both stages (measured md5-identical on us-east-1), and
