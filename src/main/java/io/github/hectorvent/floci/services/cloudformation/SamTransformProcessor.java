@@ -240,7 +240,7 @@ class SamTransformProcessor {
         JsonNode definitionUri = properties.path("DefinitionUri");
         boolean hasDefinitionBody = isPropertyPresent(definitionBody);
         boolean hasDefinitionUri = isPropertyPresent(definitionUri);
-        rejectBothDefinitionSources(logicalId, "DefinitionUri", hasDefinitionUri, "DefinitionBody", hasDefinitionBody);
+        rejectBothDefinitionSources(logicalId, "DefinitionUri", "DefinitionBody", hasDefinitionUri && hasDefinitionBody);
 
         ObjectNode apiDef = objectMapper.createObjectNode();
         apiDef.put("Type", "AWS::ApiGatewayV2::Api");
@@ -251,9 +251,9 @@ class SamTransformProcessor {
         copyIfPresent(properties, "Description", apiProps);
 
         // Preserve inline OpenAPI route definitions so the ApiGatewayV2 provisioner can
-        // materialize the routes and integrations declared by SAM DefinitionBody. Neither
-        // DefinitionBody nor DefinitionUri is accepted too: measured against real AWS, us-east-1,
-        // create-change-set, an HttpApi declaring neither still expands to an
+        // materialize the routes and integrations declared by SAM DefinitionBody. An HttpApi
+        // declaring neither DefinitionBody nor DefinitionUri is also accepted: measured against
+        // real AWS, us-east-1, create-change-set, it still expands to a bare
         // AWS::ApiGatewayV2::Api and its default stage, carrying no Body and no BodyS3Location.
         if (hasDefinitionBody) {
             apiProps.set("Body", definitionBody.deepCopy());
@@ -1153,7 +1153,7 @@ class SamTransformProcessor {
         JsonNode definitionUri = properties.path("DefinitionUri");
         boolean hasDefinition = isPropertyPresent(definition);
         boolean hasDefinitionUri = isPropertyPresent(definitionUri);
-        rejectBothDefinitionSources(logicalId, "Definition", hasDefinition, "DefinitionUri", hasDefinitionUri);
+        rejectBothDefinitionSources(logicalId, "Definition", "DefinitionUri", hasDefinition && hasDefinitionUri);
         if (!hasDefinition && !hasDefinitionUri) {
             throw new AwsException("ValidationError",
                     "Resource with id [" + logicalId + "] is invalid. Either 'Definition' or "
@@ -1172,7 +1172,7 @@ class SamTransformProcessor {
         copyRenamed(properties, "Tracing", smProps, "TracingConfiguration");
         copyIfPresent(properties, "DefinitionSubstitutions", smProps);
         if (hasDefinition) {
-            copyIfPresent(properties, "Definition", smProps);
+            smProps.set("Definition", definition.deepCopy());
         } else {
             resolveDefinitionUriOrThrow(definitionUri, "DefinitionS3Location", logicalId, smProps);
         }
@@ -1239,7 +1239,7 @@ class SamTransformProcessor {
     /** Copies {@code source.<field>} to {@code target.<targetField>} when present and non-null. */
     private void copyRenamed(JsonNode source, String field, ObjectNode target, String targetField) {
         JsonNode value = source.path(field);
-        if (!value.isMissingNode() && !value.isNull()) {
+        if (isPropertyPresent(value)) {
             target.set(targetField, value.deepCopy());
         }
     }
@@ -1258,9 +1258,9 @@ class SamTransformProcessor {
      * provisioned, and each names its two properties in its own order, {@code firstPropertyName}
      * before {@code secondPropertyName}.
      */
-    private void rejectBothDefinitionSources(String logicalId, String firstPropertyName, boolean hasFirst,
-                                              String secondPropertyName, boolean hasSecond) {
-        if (hasFirst && hasSecond) {
+    private void rejectBothDefinitionSources(String logicalId, String firstPropertyName,
+                                             String secondPropertyName, boolean bothDeclared) {
+        if (bothDeclared) {
             throw new AwsException("ValidationError",
                     "Resource with id [" + logicalId + "] is invalid. Specify either '" + firstPropertyName
                             + "' or '" + secondPropertyName + "' property and not both.", 400);
@@ -1331,7 +1331,7 @@ class SamTransformProcessor {
      * present. {@code definitionUri} here is therefore always present and non-null.
      */
     private void resolveDefinitionUriOrThrow(JsonNode definitionUri, String propertyName, String logicalId,
-                                              ObjectNode target) {
+                                             ObjectNode target) {
         ObjectNode s3Location = samUriToS3Location(definitionUri);
         if (s3Location != null) {
             target.set(propertyName, s3Location);
