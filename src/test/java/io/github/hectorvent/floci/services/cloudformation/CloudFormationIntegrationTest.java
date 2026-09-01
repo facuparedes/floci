@@ -5066,6 +5066,84 @@ class CloudFormationIntegrationTest {
             .body("item[0].type", equalTo("TOKEN"));
     }
 
+    // A native AWS::ApiGateway::RestApi's Body is not SAM-only: the same provisioner materializes
+    // it for a hand-written template, so a declared Body must create the resources and methods
+    // its OpenAPI document describes, not sit ignored as it did before.
+    @Test
+    void createStack_withApiGatewayRestApiBody_createsMethodFromOpenApiDocument() {
+        String stackName = "cfn-apigw-restapi-body-stack";
+        String template = """
+            {
+              "Resources": {
+                "RestApi": {
+                  "Type": "AWS::ApiGateway::RestApi",
+                  "Properties": {
+                    "Name": "cfn-apigw-restapi-body-api",
+                    "Body": {
+                      "openapi": "3.0.1",
+                      "paths": {
+                        "/hello": {
+                          "get": {
+                            "x-amazon-apigateway-integration": { "type": "MOCK" }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+
+        String resourcesXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().asString();
+
+        String apiId = physicalIdByLogicalId(resourcesXml, "RestApi");
+
+        String helloResourceId = given()
+        .when()
+            .get("/restapis/" + apiId + "/resources")
+        .then()
+            .statusCode(200)
+            .body("item.path", hasItem("/hello"))
+            .extract()
+            .path("item.find { it.path == '/hello' }.id");
+
+        given()
+        .when()
+            .get("/restapis/" + apiId + "/resources/" + helloResourceId + "/methods/GET/integration")
+        .then()
+            .statusCode(200)
+            .body("type", equalTo("MOCK"));
+    }
+
     // ── Issue #1163: AWS::ApiGateway::Deployment with inline StageName creates the stage ──
 
     @Test
