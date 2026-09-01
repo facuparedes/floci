@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -408,6 +409,34 @@ class SamTransformProcessorTest {
 
         assertEquals("my-bucket", code.path("S3Bucket").asText());
         assertEquals("code.zip", code.path("S3Key").asText());
+    }
+
+    @Test
+    void expandSamTemplate_functionPreservesMetadata() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersFunction": {
+                  "Type": "AWS::Serverless::Function",
+                  "Metadata": { "SamResourceId": "OrdersFunction" },
+                  "Properties": {
+                    "Handler": "index.handler",
+                    "Runtime": "nodejs20.x",
+                    "CodeUri": "s3://code-bucket/orders.zip"
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode function = processor.expandSamTemplate(template).path("Resources").path("OrdersFunction");
+
+        // SAM CLI writes SamResourceId in Metadata for every AWS::Serverless::* resource it
+        // transforms, not only state machines; copyResourceLevelAttributes is called from every
+        // arm's switch case (Function, SimpleTable, Api, HttpApi, StateMachine) so each carries it.
+        assertEquals("OrdersFunction", function.path("Metadata").path("SamResourceId").asText(),
+                "Metadata must survive the transform on the Function arm too");
     }
 
     @Test
@@ -1107,6 +1136,31 @@ class SamTransformProcessorTest {
         assertEquals("api-specs", properties.path("BodyS3Location").path("Bucket").asText());
         assertEquals("openapi.yaml", properties.path("BodyS3Location").path("Key").asText());
     }
+
+    @Test
+    void expandSamTemplate_httpApiMapsVersionedDefinitionUriToBodyS3LocationWithVersion() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyHttpApi": {
+                  "Type": "AWS::Serverless::HttpApi",
+                  "Properties": { "DefinitionUri": "s3://api-specs/openapi.yaml?versionId=abc123" }
+                }
+              }
+            }
+            """);
+
+        JsonNode bodyS3Location = processor.expandSamTemplate(template)
+                .path("Resources").path("MyHttpApi").path("Properties").path("BodyS3Location");
+
+        // samUriToS3Location is shared with expandServerlessStateMachine (see its javadoc); a
+        // versioned DefinitionUri must carry Version through on the HttpApi arm the same way.
+        assertEquals("api-specs", bodyS3Location.path("Bucket").asText());
+        assertEquals("openapi.yaml", bodyS3Location.path("Key").asText());
+        assertEquals("abc123", bodyS3Location.path("Version").asText());
+    }
+
     @Test
     void expandSamTemplate_httpApiPreservesIntrinsicDefinitionUriForProvisioning() throws Exception {
         JsonNode template = objectMapper.readTree("""
@@ -1127,5 +1181,376 @@ class SamTransformProcessorTest {
                 .path("Resources").path("MyHttpApi").path("Properties").path("BodyS3Location");
 
         assertEquals("s3://${SpecBucket}/openapi.yaml", bodyS3Location.path("Fn::Sub").asText());
+    }
+
+    @Test
+    void expandSamTemplate_stateMachineBecomesStepFunctionsStateMachine() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Properties": {
+                    "Name": "orders-sm",
+                    "Type": "EXPRESS",
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "DefinitionUri": "s3://asl-definitions/orders.asl.json",
+                    "DefinitionSubstitutions": { "OrdersTable": "orders" },
+                    "Tracing": { "Enabled": true },
+                    "Logging": {
+                      "Level": "ALL",
+                      "IncludeExecutionData": true,
+                      "Destinations": [
+                        { "CloudWatchLogsLogGroup": { "LogGroupArn": "arn:aws:logs:us-east-1:000000000000:log-group:/orders:*" } }
+                      ]
+                    },
+                    "Tags": { "team": "orders" }
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode resources = processor.expandSamTemplate(template).path("Resources");
+
+        assertFalse(resources.path("OrdersStateMachine").isMissingNode(),
+                "SAM StateMachine must survive the transform under the same logical id, not vanish");
+        JsonNode machine = resources.path("OrdersStateMachine");
+        assertEquals("AWS::StepFunctions::StateMachine", machine.path("Type").asText());
+        JsonNode props = machine.path("Properties");
+        assertEquals("orders-sm", props.path("StateMachineName").asText());
+        assertEquals("EXPRESS", props.path("StateMachineType").asText());
+        assertEquals("arn:aws:iam::000000000000:role/orders-sfn-role", props.path("RoleArn").asText());
+        assertEquals("asl-definitions", props.path("DefinitionS3Location").path("Bucket").asText());
+        assertEquals("orders.asl.json", props.path("DefinitionS3Location").path("Key").asText());
+        assertEquals("orders", props.path("DefinitionSubstitutions").path("OrdersTable").asText());
+        assertTrue(props.path("TracingConfiguration").path("Enabled").asBoolean());
+        assertEquals("ALL", props.path("LoggingConfiguration").path("Level").asText());
+
+        JsonNode tags = props.path("Tags");
+        assertTrue(tags.isArray(), "SAM's Tags map must become the native list-of-{Key,Value} shape");
+        assertEquals(2, tags.size());
+        assertEquals("stateMachine:createdBy", tags.get(0).path("Key").asText());
+        assertEquals("SAM", tags.get(0).path("Value").asText());
+        assertEquals("team", tags.get(1).path("Key").asText());
+        assertEquals("orders", tags.get(1).path("Value").asText());
+    }
+
+    @Test
+    void expandSamTemplate_stateMachineWithLocalDefinitionUriIsRejected() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Properties": {
+                    "Name": "orders-sm",
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "DefinitionUri": "./src/stepFunctions/orders.asl.json"
+                  }
+                }
+              }
+            }
+            """);
+
+        AwsException exception = assertThrows(AwsException.class,
+                () -> processor.expandSamTemplate(template));
+
+        // Measured against real AWS, us-east-1, create-change-set does not
+        // reject the API call: it creates the change set and marks it FAILED with this exact
+        // sentence in StatusReason. The message is asserted as a literal, not a substring, so an
+        // invented wording can no longer pass this test.
+        assertEquals("ValidationError", exception.getErrorCode());
+        assertEquals("Resource with id [OrdersStateMachine] is invalid. 'DefinitionUri' is not a "
+                        + "valid S3 Uri of the form 's3://bucket/key' with optional versionId "
+                        + "query parameter.",
+                exception.getMessage());
+    }
+
+    @Test
+    void expandSamTemplate_stateMachineWithQuestionMarkInKeyIsAccepted() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Properties": {
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "DefinitionUri": "s3://asl-definitions/orders.asl.json?foo=1"
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode location = processor.expandSamTemplate(template)
+                .path("Resources").path("OrdersStateMachine").path("Properties").path("DefinitionS3Location");
+
+        // S3 permits a literal '?' in a key; only a trailing '?versionId=' is a query separator,
+        // so a key carrying an unrelated query string must still match, keeping the '?' in Key.
+        assertEquals("asl-definitions", location.path("Bucket").asText());
+        assertEquals("orders.asl.json?foo=1", location.path("Key").asText(),
+                "a '?' not followed by 'versionId=' belongs to the key, not a stripped query string");
+        assertTrue(location.path("Version").isMissingNode(), "no versionId means no Version field");
+    }
+
+    @Test
+    void expandSamTemplate_stateMachineWithS3UriMissingKeyIsRejected() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Properties": {
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "DefinitionUri": "s3://asl-definitions"
+                  }
+                }
+              }
+            }
+            """);
+
+        AwsException exception = assertThrows(AwsException.class,
+                () -> processor.expandSamTemplate(template));
+
+        // A bucket-only DefinitionUri fails the same 's3://bucket/key' shape check as a local
+        // path; the two must not be told apart into different messages, and the failure must
+        // surface here rather than downstream from the provisioner's generic "Specify exactly
+        // one of Definition, DefinitionString, or DefinitionS3Location", which names neither the
+        // logical id nor DefinitionUri nor the value.
+        assertEquals("ValidationError", exception.getErrorCode());
+        assertEquals("Resource with id [OrdersStateMachine] is invalid. 'DefinitionUri' is not a "
+                        + "valid S3 Uri of the form 's3://bucket/key' with optional versionId "
+                        + "query parameter.",
+                exception.getMessage());
+    }
+
+    @Test
+    void expandSamTemplate_stateMachineWithVersionedDefinitionUriSplitsVersion() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Properties": {
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "DefinitionUri": "s3://asl-definitions/orders.asl.json?versionId=abc123"
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode location = processor.expandSamTemplate(template)
+                .path("Resources").path("OrdersStateMachine").path("Properties").path("DefinitionS3Location");
+
+        // Measured against real AWS, us-east-1: a versioned DefinitionUri splits into a
+        // third field rather than folding the query string into Key:
+        // {"Bucket": "...", "Key": "...", "Version": "abc123"}.
+        assertEquals("asl-definitions", location.path("Bucket").asText());
+        assertEquals("orders.asl.json", location.path("Key").asText(),
+                "the '?versionId=...' query string must not be folded into Key");
+        assertEquals("abc123", location.path("Version").asText());
+    }
+
+    @Test
+    void expandSamTemplate_stateMachinePreservesMetadataAndDependsOn() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersRole": {
+                  "Type": "AWS::IAM::Role",
+                  "Properties": {}
+                },
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Metadata": { "SamResourceId": "OrdersStateMachine" },
+                  "DependsOn": "OrdersRole",
+                  "Properties": {
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role"
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode machine = processor.expandSamTemplate(template).path("Resources").path("OrdersStateMachine");
+
+        // Measured against real AWS, us-east-1: Metadata carries through on 67 of 67 deployed
+        // state machines. CloudFormation, not SAM, writes it into the Processed template, so any
+        // sibling of Type/Properties on the SAM resource node must survive the same way. This
+        // measurement covers Metadata only; DependsOn survival is asserted below as the same
+        // generic sibling-copy behaviour, not as a separately measured claim.
+        assertEquals("OrdersStateMachine", machine.path("Metadata").path("SamResourceId").asText(),
+                "Metadata must survive the transform with its literal value");
+        assertEquals("OrdersRole", machine.path("DependsOn").asText(),
+                "a declared DependsOn must survive the transform");
+    }
+
+    @Test
+    void expandSamTemplate_stateMachinePreservesIntrinsicNameAndRole() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersRole": {
+                  "Type": "AWS::IAM::Role",
+                  "Properties": {}
+                },
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Properties": {
+                    "Name": { "Fn::Sub": "${Environment}-orders-sm" },
+                    "Role": { "Fn::GetAtt": ["OrdersRole", "Arn"] }
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode props = processor.expandSamTemplate(template)
+                .path("Resources").path("OrdersStateMachine").path("Properties");
+
+        // copyRenamed must deep-copy the node, never read it with asText(): asText() on an object
+        // node silently returns "", which would collapse RoleArn/StateMachineName to an empty
+        // string instead of failing loudly.
+        assertTrue(props.path("StateMachineName").isObject(),
+                "an intrinsic Name must survive as an object, not be stringified");
+        assertEquals("${Environment}-orders-sm", props.path("StateMachineName").path("Fn::Sub").asText());
+        assertTrue(props.path("RoleArn").isObject(),
+                "an intrinsic Role must survive as an object, not be stringified");
+        JsonNode getAtt = props.path("RoleArn").path("Fn::GetAtt");
+        assertEquals("OrdersRole", getAtt.get(0).asText());
+        assertEquals("Arn", getAtt.get(1).asText());
+    }
+
+    @Test
+    void expandSamTemplate_stateMachineWithEmptyTagMapEmitsOnlyTheSamTag() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Properties": {
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "Tags": {}
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode tags = processor.expandSamTemplate(template)
+                .path("Resources").path("OrdersStateMachine").path("Properties").path("Tags");
+
+        assertTrue(tags.isArray());
+        assertEquals(1, tags.size(), "an empty Tags map must not emit zero entries; SAM still adds its own");
+        assertEquals("stateMachine:createdBy", tags.get(0).path("Key").asText());
+        assertEquals("SAM", tags.get(0).path("Value").asText());
+    }
+
+    @Test
+    void expandSamTemplate_stateMachineTagValueKeepsItsJsonType() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Properties": {
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "Tags": {
+                      "project-id": 12345678,
+                      "environment": { "Ref": "Environment" }
+                    }
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode tags = processor.expandSamTemplate(template)
+                .path("Resources").path("OrdersStateMachine").path("Properties").path("Tags");
+
+        JsonNode projectIdTag = null;
+        JsonNode environmentTag = null;
+        for (JsonNode tag : tags) {
+            if ("project-id".equals(tag.path("Key").asText())) {
+                projectIdTag = tag;
+            }
+            if ("environment".equals(tag.path("Key").asText())) {
+                environmentTag = tag;
+            }
+        }
+
+        assertTrue(projectIdTag.path("Value").isNumber(),
+                "a numeric tag value must survive as a JSON number, not be stringified");
+        assertEquals(12345678, projectIdTag.path("Value").asInt());
+        assertTrue(environmentTag.path("Value").isObject(),
+                "an intrinsic tag value must survive as an object, not be stringified");
+        assertEquals("Environment", environmentTag.path("Value").path("Ref").asText());
+    }
+
+    @Test
+    void expandSamTemplate_stateMachineWithIntrinsicDefinitionUri() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Properties": {
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "DefinitionUri": { "Fn::Sub": "s3://${SpecBucket}/orders.asl.json" }
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode definitionS3Location = processor.expandSamTemplate(template)
+                .path("Resources").path("OrdersStateMachine").path("Properties").path("DefinitionS3Location");
+
+        assertEquals("s3://${SpecBucket}/orders.asl.json", definitionS3Location.path("Fn::Sub").asText(),
+                "an intrinsic DefinitionUri cannot be split and must pass through unsplit, "
+                        + "not be rejected by the local-path guard, which fires on textual values only");
+    }
+
+    @Test
+    void expandSamTemplate_stateMachineWithInlineDefinition() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "OrdersStateMachine": {
+                  "Type": "AWS::Serverless::StateMachine",
+                  "Properties": {
+                    "Role": "arn:aws:iam::000000000000:role/orders-sfn-role",
+                    "Definition": {
+                      "StartAt": "Done",
+                      "States": { "Done": { "Type": "Pass", "End": true } }
+                    }
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode machine = processor.expandSamTemplate(template).path("Resources").path("OrdersStateMachine");
+        JsonNode props = machine.path("Properties");
+
+        assertEquals("AWS::StepFunctions::StateMachine", machine.path("Type").asText(),
+                "a Definition-only machine must still be expanded to the native type");
+        assertTrue(props.path("DefinitionS3Location").isMissingNode(),
+                "no DefinitionUri was given, so no DefinitionS3Location must appear");
+        assertEquals("Done", props.path("Definition").path("StartAt").asText());
+        assertEquals("Pass", props.path("Definition").path("States").path("Done").path("Type").asText());
     }
 }

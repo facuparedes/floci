@@ -17,6 +17,7 @@ import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.hasItems;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.startsWith;
 import static org.hamcrest.Matchers.nullValue;
 
 @QuarkusTest
@@ -960,6 +961,356 @@ class SamTransformIntegrationTest {
         .then()
             .statusCode(200)
             .body("Configuration.FunctionName", equalTo("sam-changeset-func"));
+    }
+
+    @Test
+    void samStateMachine_createsStepFunctionsStateMachine() {
+        String stackName = "sam-sfn-stack";
+        stacksToDelete.add(stackName);
+
+        given()
+        .when()
+            .put("/sam-asl-bucket")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .body("{\"StartAt\":\"Done\",\"States\":{\"Done\":{\"Type\":\"Pass\",\"End\":true}}}")
+        .when()
+            .put("/sam-asl-bucket/orders.asl.json")
+        .then()
+            .statusCode(200);
+
+        String template = """
+            AWSTemplateFormatVersion: '2010-09-09'
+            Transform: AWS::Serverless-2016-10-31
+            Resources:
+              OrdersStateMachine:
+                Type: AWS::Serverless::StateMachine
+                Properties:
+                  Name: sam-orders-sm
+                  Type: STANDARD
+                  Role: arn:aws:iam::000000000000:role/orders-sfn-role
+                  DefinitionUri: s3://sam-asl-bucket/orders.asl.json
+            Outputs:
+              MachineArn:
+                Value: !GetAtt OrdersStateMachine.Arn
+              MachineName:
+                Value: !GetAtt OrdersStateMachine.Name
+              MachineRevisionId:
+                Value: !GetAtt OrdersStateMachine.StateMachineRevisionId
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+            .formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        waitForStackStatus(stackName, "CREATE_COMPLETE");
+
+        String describeStacks = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().asString();
+
+        // AGENTS.md:289-291 asks for the exact Fn::GetAtt key set the provisioner publishes
+        // (CloudFormationResourceProvisioner.java:4231-4233): Arn, Name, StateMachineRevisionId.
+        // Asserting only "not a stub ARN" (as red loop 2 did) would also pass on an empty Output.
+        String machineArn = stackOutputValue(describeStacks, "MachineArn");
+        assertThat(machineArn, startsWith("arn:aws:states:"));
+        assertThat(machineArn, not(containsString("arn:aws:stub:::")));
+        assertThat(stackOutputValue(describeStacks, "MachineName"), equalTo("sam-orders-sm"));
+        assertThat(stackOutputValue(describeStacks, "MachineRevisionId"), not(equalTo("")));
+
+        given()
+            .header("X-Amz-Target", "AWSStepFunctions.ListStateMachines")
+            .contentType("application/x-amz-json-1.0")
+            .body("{}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("stateMachines.name", hasItem("sam-orders-sm"));
+    }
+
+    @Test
+    void samStateMachine_withLocalDefinitionUri_createFails() {
+        // This is the shape all 172 source templates measured across 19 repositories carry:
+        // `sam package` never ran, so DefinitionUri is still a local path. Real SAM rejects this
+        // the same way, and here the ValidationError is thrown by expandServerlessStateMachine
+        // inside expandSamTemplate, called before the per-resource provisioning loop starts. With
+        // no resource attempted, there is nothing to roll back: the stack lands directly on
+        // CREATE_FAILED, not ROLLBACK_COMPLETE.
+        String stackName = "sam-sfn-local-uri-stack";
+        stacksToDelete.add(stackName);
+
+        String template = """
+            AWSTemplateFormatVersion: '2010-09-09'
+            Transform: AWS::Serverless-2016-10-31
+            Resources:
+              OrdersStateMachine:
+                Type: AWS::Serverless::StateMachine
+                Properties:
+                  Name: sam-orders-local-sm
+                  Role: arn:aws:iam::000000000000:role/orders-sfn-role
+                  DefinitionUri: ./src/stepFunctions/orders.asl.json
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+            .formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        waitForStackStatus(stackName, "CREATE_FAILED");
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>")))
+            // XmlBuilder.elem escapes the single quotes AWS's own wording uses around
+            // 'DefinitionUri' and 's3://bucket/key' to &apos;.
+            .body(containsString("Resource with id [OrdersStateMachine] is invalid. "
+                    + "&apos;DefinitionUri&apos; is not a valid S3 Uri of the form "
+                    + "&apos;s3://bucket/key&apos; with optional versionId query parameter."));
+
+        // Nothing was provisioned: the transform rejects the whole template before the
+        // per-resource loop attempts a single resource, so no state machine (stub or real)
+        // ever appears in the resource list.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("<member>")))
+            .body(not(containsString("AWS::StepFunctions::StateMachine")));
+    }
+
+    @Test
+    void samStateMachine_withLocalDefinitionUri_createChangeSetReportsFailedStatus() {
+        // Measured against real AWS, us-east-1, aws cloudformation create-change-set
+        // does not reject this API call with an HTTP error: it creates the change set and marks
+        // it FAILED, reporting the transform's own message in StatusReason with 0 Changes.
+        String stackName = "sam-sfn-changeset-local-uri-stack";
+        stacksToDelete.add(stackName);
+
+        String template = """
+            AWSTemplateFormatVersion: '2010-09-09'
+            Transform: AWS::Serverless-2016-10-31
+            Resources:
+              OrdersStateMachine:
+                Type: AWS::Serverless::StateMachine
+                Properties:
+                  Name: sam-orders-changeset-local-sm
+                  Role: arn:aws:iam::000000000000:role/orders-sfn-role
+                  DefinitionUri: ./src/stepFunctions/orders.asl.json
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "initial")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+            .formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Id>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "initial")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Status>FAILED</Status>"))
+            .body(containsString("<ExecutionStatus>UNAVAILABLE</ExecutionStatus>"))
+            .body(containsString("<StatusReason>Transform AWS::Serverless-2016-10-31 failed "
+                    + "with: Invalid Serverless Application Specification document. Number of "
+                    + "errors found: 1. Resource with id [OrdersStateMachine] is invalid. "
+                    + "&apos;DefinitionUri&apos; is not a valid S3 Uri of the form "
+                    + "&apos;s3://bucket/key&apos; with optional versionId query "
+                    + "parameter.</StatusReason>"))
+            .body(not(containsString("<member>")));
+    }
+
+    @Test
+    void samStateMachine_withLocalDefinitionUri_executeChangeSetIsRejected() {
+        // A change set a failed SAM transform already marked FAILED/UNAVAILABLE cannot be
+        // executed. Real CloudFormation refuses ExecuteChangeSet with InvalidChangeSetStatus,
+        // naming the change set's ARN and its current status, instead of running it and landing
+        // CREATE_FAILED, which would burn the stack name (see #2207).
+        String stackName = "sam-sfn-changeset-execute-rejected-stack";
+        stacksToDelete.add(stackName);
+
+        String template = """
+            AWSTemplateFormatVersion: '2010-09-09'
+            Transform: AWS::Serverless-2016-10-31
+            Resources:
+              OrdersStateMachine:
+                Type: AWS::Serverless::StateMachine
+                Properties:
+                  Name: sam-orders-execute-rejected-sm
+                  Role: arn:aws:iam::000000000000:role/orders-sfn-role
+                  DefinitionUri: ./src/stepFunctions/orders.asl.json
+            """;
+
+        String createChangeSetXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "initial")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+            .formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Id>"))
+            .extract().asString();
+        String changeSetId = createChangeSetXml.split("<Id>")[1].split("</Id>")[0];
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ExecuteChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "initial")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>InvalidChangeSetStatus</Code>"))
+            .body(containsString("<Message>ChangeSet [" + changeSetId + "] cannot be executed in "
+                    + "its current status of [FAILED]</Message>"));
+
+        // The AWS CLI's has_stack treats a REVIEW_IN_PROGRESS stack as nonexistent (see
+        // createChangeSetForRequest's javadoc); the rejected execute must leave the stack there,
+        // never CREATE_FAILED, so the name stays reusable rather than requiring an explicit
+        // DeleteStack.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>REVIEW_IN_PROGRESS</StackStatus>"))
+            .body(not(containsString("CREATE_FAILED")));
+    }
+
+    @Test
+    void samStateMachine_withDefinitionSubstitutions_resolvesPlaceholders() {
+        String stackName = "sam-sfn-subs-stack";
+        stacksToDelete.add(stackName);
+
+        given()
+        .when()
+            .put("/sam-asl-subs-bucket")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .body("{\"StartAt\":\"Done\",\"States\":{\"Done\":{\"Type\":\"Pass\",\"Result\":\"${TableName}\",\"End\":true}}}")
+        .when()
+            .put("/sam-asl-subs-bucket/orders.asl.json")
+        .then()
+            .statusCode(200);
+
+        String template = """
+            AWSTemplateFormatVersion: '2010-09-09'
+            Transform: AWS::Serverless-2016-10-31
+            Resources:
+              OrdersStateMachine:
+                Type: AWS::Serverless::StateMachine
+                Properties:
+                  Name: sam-orders-subs-sm
+                  Role: arn:aws:iam::000000000000:role/orders-sfn-role
+                  DefinitionUri: s3://sam-asl-subs-bucket/orders.asl.json
+                  DefinitionSubstitutions:
+                    TableName: my-orders-table
+            Outputs:
+              MachineArn:
+                Value: !GetAtt OrdersStateMachine.Arn
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+            .formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        waitForStackStatus(stackName, "CREATE_COMPLETE");
+
+        String describeStacks = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().asString();
+        String machineArn = stackOutputValue(describeStacks, "MachineArn");
+
+        given()
+            .header("X-Amz-Target", "AWSStepFunctions.DescribeStateMachine")
+            .contentType("application/x-amz-json-1.0")
+            .body("{\"stateMachineArn\":\"" + machineArn + "\"}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("definition", containsString("my-orders-table"))
+            .body("definition", not(containsString("${TableName}")));
+    }
+
+    private static String stackOutputValue(String describeStacksXml, String outputKey) {
+        return describeStacksXml
+                .split("<OutputKey>" + outputKey + "</OutputKey>")[1]
+                .split("<OutputValue>")[1]
+                .split("</OutputValue>")[0];
     }
 
     private static byte[] buildHandlerZip() {
