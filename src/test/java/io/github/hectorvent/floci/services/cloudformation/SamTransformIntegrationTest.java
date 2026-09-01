@@ -539,10 +539,11 @@ class SamTransformIntegrationTest {
     }
 
     @Test
-    void samApi_declaredNameSurvivesDefinitionBodyTitle() {
+    void samApi_declaredNameAndDescriptionSurviveMaterializedDefinitionBody() {
         String suffix = Long.toString(System.nanoTime(), 36);
         String stackName = "sam-api-name-" + suffix;
         String apiName = "sam-api-name-" + suffix;
+        String apiDescription = "declared-description-" + suffix;
         stacksToDelete.add(stackName);
 
         String template = """
@@ -553,15 +554,16 @@ class SamTransformIntegrationTest {
                 Type: AWS::Serverless::Api
                 Properties:
                   Name: %s
+                  Description: %s
                   DefinitionBody:
                     openapi: 3.0.1
-                    info: {title: title-from-document, version: '1.0'}
+                    info: {title: title-from-document, description: description-from-document, version: '1.0'}
                     paths:
                       /hello:
                         get:
                           x-amazon-apigateway-integration:
                             type: MOCK
-            """.formatted(apiName);
+            """.formatted(apiName, apiDescription);
 
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -576,16 +578,39 @@ class SamTransformIntegrationTest {
 
         waitForStackStatus(stackName, "CREATE_COMPLETE");
 
-        // The declared Name wins over the DefinitionBody's info.title (measured against real
-        // AWS, us-east-1, create-change-set): without the provisioner re-applying it after
-        // putRestApi, the API would silently end up named "title-from-document" instead.
-        given()
+        // putRestApi overwrites Name and Description from the DefinitionBody's info, so the
+        // provisioner re-applies the declared Name and Description immediately after: this
+        // proves what floci's provisioner does with the processed template, not what real
+        // AWS's runtime prefers. The /hello method assertion below proves the reapply runs on
+        // the same path that also turns the DefinitionBody into resources and methods, so a
+        // provisioner that never reads DefinitionBody at all cannot pass this test.
+        String apiId = given()
         .when()
             .get("/restapis")
         .then()
             .statusCode(200)
             .body("item.name", hasItem(apiName))
-            .body("item.name", not(hasItem("title-from-document")));
+            .body("item.name", not(hasItem("title-from-document")))
+            .body("item.find { it.name == '" + apiName + "' }.description", equalTo(apiDescription))
+            .body("item.description", not(hasItem("description-from-document")))
+            .extract()
+            .path("item.find { it.name == '" + apiName + "' }.id");
+
+        String helloResourceId = given()
+        .when()
+            .get("/restapis/" + apiId + "/resources")
+        .then()
+            .statusCode(200)
+            .body("item.path", hasItem("/hello"))
+            .extract()
+            .path("item.find { it.path == '/hello' }.id");
+
+        given()
+        .when()
+            .get("/restapis/" + apiId + "/resources/" + helloResourceId + "/methods/GET/integration")
+        .then()
+            .statusCode(200)
+            .body("type", equalTo("MOCK"));
     }
 
     @Test
