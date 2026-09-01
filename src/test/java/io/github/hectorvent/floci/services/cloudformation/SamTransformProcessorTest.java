@@ -558,6 +558,88 @@ class SamTransformProcessorTest {
     }
 
     @Test
+    void expandSamTemplate_apiPreservesDefinitionBodyAsBody() throws Exception {
+        // A route-bearing Api carries its routes in the inline OpenAPI DefinitionBody, which
+        // must survive as the RestApi's Body — otherwise the deployed API serves no method.
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyApi": {
+                  "Type": "AWS::Serverless::Api",
+                  "Properties": {
+                    "DefinitionBody": {
+                      "openapi": "3.0.1",
+                      "paths": {
+                        "/hello": { "get": { "x-amazon-apigateway-integration": { "type": "MOCK" } } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode resources = processor.expandSamTemplate(template).path("Resources");
+
+        JsonNode api = resources.path("MyApi");
+        assertEquals("AWS::ApiGateway::RestApi", api.path("Type").asText());
+        JsonNode body = api.path("Properties").path("Body");
+        assertFalse(body.isMissingNode(), "DefinitionBody must be preserved as the RestApi Body");
+        assertEquals("3.0.1", body.path("openapi").asText());
+        assertTrue(body.path("paths").has("/hello"), "route definitions must survive the transform");
+    }
+
+    @Test
+    void expandSamTemplate_apiMapsDefinitionUriToBodyS3Location() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyApi": {
+                  "Type": "AWS::Serverless::Api",
+                  "Properties": { "DefinitionUri": "s3://api-specs/openapi.yaml" }
+                }
+              }
+            }
+            """);
+
+        JsonNode properties = processor.expandSamTemplate(template)
+                .path("Resources").path("MyApi").path("Properties");
+
+        assertTrue(properties.path("Body").isMissingNode(), "DefinitionUri must not become an inline Body");
+        assertEquals("api-specs", properties.path("BodyS3Location").path("Bucket").asText());
+        assertEquals("openapi.yaml", properties.path("BodyS3Location").path("Key").asText());
+    }
+
+    @Test
+    void expandSamTemplate_apiWithLocalDefinitionUriIsRejected() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyApi": {
+                  "Type": "AWS::Serverless::Api",
+                  "Properties": { "DefinitionUri": "./openapi.yaml" }
+                }
+              }
+            }
+            """);
+
+        AwsException exception = assertThrows(AwsException.class,
+                () -> processor.expandSamTemplate(template));
+
+        // Measured against real AWS, us-east-1, create-change-set: a local-path DefinitionUri is
+        // rejected with the same string-form wording the StateMachine and HttpApi arms already
+        // carry, not silently accepted with no Body and no BodyS3Location.
+        assertEquals("ValidationError", exception.getErrorCode());
+        assertEquals("Resource with id [MyApi] is invalid. 'DefinitionUri' is not a valid S3 "
+                        + "Uri of the form 's3://bucket/key' with optional versionId query "
+                        + "parameter.",
+                exception.getMessage());
+    }
+
+    @Test
     void expandSamTemplate_mixedResources() throws Exception {
         JsonNode template = objectMapper.readTree("""
             {

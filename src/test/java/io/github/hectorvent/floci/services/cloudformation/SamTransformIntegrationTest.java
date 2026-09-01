@@ -471,6 +471,124 @@ class SamTransformIntegrationTest {
     }
 
     @Test
+    void samApi_definitionBodyCreatesApiGatewayMethods() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "sam-api-body-" + suffix;
+        String apiName = "sam-api-body-" + suffix;
+        stacksToDelete.add(stackName);
+
+        String template = """
+            AWSTemplateFormatVersion: '2010-09-09'
+            Transform: AWS::Serverless-2016-10-31
+            Resources:
+              MyApi:
+                Type: AWS::Serverless::Api
+                Properties:
+                  Name: %s
+                  StageName: prod
+                  DefinitionBody:
+                    openapi: 3.0.1
+                    paths:
+                      /hello:
+                        get:
+                          x-amazon-apigateway-integration:
+                            type: MOCK
+                      /widgets:
+                        post:
+                          x-amazon-apigateway-integration:
+                            type: MOCK
+            """.formatted(apiName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        waitForStackStatus(stackName, "CREATE_COMPLETE");
+
+        String apiId = given()
+        .when()
+            .get("/restapis")
+        .then()
+            .statusCode(200)
+            .body("item.find { it.name == '" + apiName + "' }.name", equalTo(apiName))
+            .extract()
+            .path("item.find { it.name == '" + apiName + "' }.id");
+
+        String helloResourceId = given()
+        .when()
+            .get("/restapis/" + apiId + "/resources")
+        .then()
+            .statusCode(200)
+            .body("item.path", hasItems("/hello", "/widgets"))
+            .extract()
+            .path("item.find { it.path == '/hello' }.id");
+
+        given()
+        .when()
+            .get("/restapis/" + apiId + "/resources/" + helloResourceId + "/methods/GET/integration")
+        .then()
+            .statusCode(200)
+            .body("type", equalTo("MOCK"));
+    }
+
+    @Test
+    void samApi_declaredNameSurvivesDefinitionBodyTitle() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "sam-api-name-" + suffix;
+        String apiName = "sam-api-name-" + suffix;
+        stacksToDelete.add(stackName);
+
+        String template = """
+            AWSTemplateFormatVersion: '2010-09-09'
+            Transform: AWS::Serverless-2016-10-31
+            Resources:
+              MyApi:
+                Type: AWS::Serverless::Api
+                Properties:
+                  Name: %s
+                  DefinitionBody:
+                    openapi: 3.0.1
+                    info: {title: title-from-document, version: '1.0'}
+                    paths:
+                      /hello:
+                        get:
+                          x-amazon-apigateway-integration:
+                            type: MOCK
+            """.formatted(apiName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        waitForStackStatus(stackName, "CREATE_COMPLETE");
+
+        // The declared Name wins over the DefinitionBody's info.title (measured against real
+        // AWS, us-east-1, create-change-set): without the provisioner re-applying it after
+        // putRestApi, the API would silently end up named "title-from-document" instead.
+        given()
+        .when()
+            .get("/restapis")
+        .then()
+            .statusCode(200)
+            .body("item.name", hasItem(apiName))
+            .body("item.name", not(hasItem("title-from-document")));
+    }
+
+    @Test
     void samHttpApi_definitionBodyCreatesApiGatewayV2Routes() {
         String suffix = Long.toString(System.nanoTime(), 36);
         String stackName = "sam-http-api-" + suffix;
