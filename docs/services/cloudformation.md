@@ -257,10 +257,11 @@ Three known deviations from AWS:
 against that enum, rejecting anything else with a `ValidationError` naming the value, matching AWS.
 `Original` returns the template exactly as submitted (`Fn::Transform` node and all); `Processed`
 returns the merged/SAM-expanded tree that a `CreateChangeSet` preview also diffs against. A
-`Transform` floci does not expand (a third-party macro, `AWS::LanguageExtensions`) leaves
-`Processed` holding the unexpanded body, since `executeTemplate` only re-serializes the template
-for SAM and `AWS::Include`; real AWS's answer for that case has not been measured against a real
-account. `StagesAvailable` always lists both stages, matching AWS.
+third-party macro, `AWS::LanguageExtensions`, and the top-level `Transform: {Name: AWS::Include,
+Parameters: {Location: ...}}` form (which floci never splices) all leave `Processed` holding the
+unexpanded body, since `executeTemplate` only re-serializes the template for SAM and the embedded
+`Fn::Transform`/`AWS::Include` form described above. Real AWS's answer for any of these cases is
+unmeasured. `StagesAvailable` always lists both stages, matching AWS.
 
 ## Conditions
 

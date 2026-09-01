@@ -582,20 +582,28 @@ public class CloudFormationService implements ResourceProvider {
 
     // ── GetTemplate ───────────────────────────────────────────────────────────
 
+    // The two GetTemplate stages, named once so the ValidationError enum list, the
+    // StagesAvailable list, the stage-selection check and the default below cannot diverge.
+    private static final String STAGE_PROCESSED = "Processed";
+    private static final String STAGE_ORIGINAL = "Original";
+
     // AWS's own enum order for the ValidationError message (measured against a real account).
-    private static final List<String> TEMPLATE_STAGE_ENUM = List.of("Processed", "Original");
+    private static final List<String> TEMPLATE_STAGE_ENUM = List.of(STAGE_PROCESSED, STAGE_ORIGINAL);
     // AWS's own StagesAvailable order (Original first), which every GetTemplate call reports.
-    private static final List<String> TEMPLATE_STAGES_AVAILABLE = List.of("Original", "Processed");
+    private static final List<String> TEMPLATE_STAGES_AVAILABLE = List.of(STAGE_ORIGINAL, STAGE_PROCESSED);
 
     public String getTemplate(String stackName, String templateStage, String region) {
-        Stack stack = getStackOrThrow(stackName, region);
+        // AWS validates TemplateStage before it looks the stack up (measured against a real
+        // account: an invalid stage is rejected the same way whether or not the stack exists), so
+        // this must run before getStackOrThrow.
         String stage = validateTemplateStage(templateStage);
+        Stack stack = getStackOrThrow(stackName, region);
         // Processed is the SAM/AWS::Include-expanded form templateBody holds after executeTemplate.
         // Original (also the default, matching real AWS) is the template exactly as the caller
         // submitted it. originalTemplateBody is only absent for stacks persisted by a floci version
         // predating this field, hence the fallback to templateBody; getTemplateSummary reads the
         // same field for the same reason.
-        String body = "Processed".equals(stage) ? stack.getTemplateBody() : stack.getOriginalTemplateBody();
+        String body = STAGE_PROCESSED.equals(stage) ? stack.getTemplateBody() : stack.getOriginalTemplateBody();
         if (body == null) {
             body = stack.getTemplateBody();
         }
@@ -603,8 +611,11 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     private String validateTemplateStage(String templateStage) {
-        if (templateStage == null || templateStage.isBlank()) {
-            return "Original";
+        // null means the caller omitted TemplateStage; "" means the caller sent it present and
+        // empty. AWS rejects the latter (measured against a real account) and only defaults the
+        // former, so this must not treat blank the same as absent.
+        if (templateStage == null) {
+            return STAGE_ORIGINAL;
         }
         if (!TEMPLATE_STAGE_ENUM.contains(templateStage)) {
             throw new AwsException("ValidationError",
@@ -1336,9 +1347,11 @@ public class CloudFormationService implements ResourceProvider {
         stack.getResolvedParameters().putAll(previousState.resolvedParameters());
         if (rollbackFailures.isEmpty()) {
             stack.setTemplateBody(previousState.templateBody());
-            // GetTemplate reads originalTemplateBody, not templateBody: without restoring it here
-            // too, a rolled-back update would keep serving the failed attempt's submitted body
-            // even though every other piece of state (resources, parameters, outputs) was restored.
+            // GetTemplate reads originalTemplateBody for TemplateStage=Original and templateBody
+            // for TemplateStage=Processed: without restoring originalTemplateBody here too, a
+            // rolled-back update would keep serving the failed attempt's submitted body under
+            // Original even though every other piece of state (resources, parameters, outputs)
+            // was restored.
             stack.setOriginalTemplateBody(previousState.originalTemplateBody());
         }
         try {
