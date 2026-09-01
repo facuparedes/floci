@@ -5039,7 +5039,7 @@ public class CloudFormationResourceProvisioner {
         }
 
         JsonNode location = engine.resolveNode(props.get("BodyS3Location"));
-        ApiGatewayV2BodyS3Location bodyS3Location = parseOpenApiBodyS3Location(location);
+        OpenApiBodyS3Location bodyS3Location = parseOpenApiBodyS3Location(location);
 
         try {
             byte[] document = s3Service.getObject(bodyS3Location.bucket(), bodyS3Location.key(),
@@ -5058,14 +5058,14 @@ public class CloudFormationResourceProvisioner {
         }
     }
 
-    private ApiGatewayV2BodyS3Location parseOpenApiBodyS3Location(JsonNode location) {
+    private OpenApiBodyS3Location parseOpenApiBodyS3Location(JsonNode location) {
         if (location != null && location.isTextual()) {
             String uri = location.asText();
             if (uri.startsWith("s3://")) {
                 String withoutScheme = uri.substring("s3://".length());
                 int slash = withoutScheme.indexOf('/');
                 if (slash > 0 && slash < withoutScheme.length() - 1) {
-                    return new ApiGatewayV2BodyS3Location(withoutScheme.substring(0, slash),
+                    return new OpenApiBodyS3Location(withoutScheme.substring(0, slash),
                             withoutScheme.substring(slash + 1), null);
                 }
             }
@@ -5073,7 +5073,7 @@ public class CloudFormationResourceProvisioner {
             String bucket = textOrNull(location, "Bucket");
             String key = textOrNull(location, "Key");
             if (bucket != null && !bucket.isBlank() && key != null && !key.isBlank()) {
-                return new ApiGatewayV2BodyS3Location(bucket, key, textOrNull(location, "Version"));
+                return new OpenApiBodyS3Location(bucket, key, textOrNull(location, "Version"));
             }
         }
         throw new AwsException("ValidationException",
@@ -5550,7 +5550,7 @@ public class CloudFormationResourceProvisioner {
 
     private record OpenApiAuthorizerBinding(String authorizationType, String authorizerId) {}
 
-    private record ApiGatewayV2BodyS3Location(String bucket, String key, String version) {}
+    private record OpenApiBodyS3Location(String bucket, String key, String version) {}
 
     private static final class ApiGatewayV2BodyMaterializationException extends RuntimeException {
         private final ApiGatewayV2BodyResources resources;
