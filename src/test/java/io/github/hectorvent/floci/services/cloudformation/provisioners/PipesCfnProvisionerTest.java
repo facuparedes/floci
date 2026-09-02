@@ -14,6 +14,7 @@ import org.mockito.InOrder;
 
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -24,6 +25,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -77,9 +79,22 @@ class PipesCfnProvisionerTest {
             pipe.setArn("arn:aws:pipes:us-east-1:000000000000:pipe/" + name);
             pipe.setSource(i.getArgument(1));
             pipe.setTarget(i.getArgument(2));
+            Map<String, String> tags = i.getArgument(10);
+            pipe.setTags(tags != null ? new HashMap<>(tags) : new HashMap<>());
             pipesOnFile.put(name, pipe);
             return pipe;
         });
+        when(pipes.listTags(anyString(), anyString()))
+                .thenAnswer(i -> pipeByArn(i.getArgument(1)).getTags());
+        doAnswer(i -> {
+            pipeByArn(i.getArgument(1)).getTags().putAll(i.<Map<String, String>>getArgument(2));
+            return null;
+        }).when(pipes).tagResource(anyString(), anyString(), any());
+        doAnswer(i -> {
+            Pipe pipe = pipeByArn(i.getArgument(1));
+            i.<List<String>>getArgument(2).forEach(pipe.getTags()::remove);
+            return null;
+        }).when(pipes).untagResource(anyString(), anyString(), any());
         when(pipes.describePipe(anyString(), anyString())).thenAnswer(i -> {
             String name = i.getArgument(0);
             Pipe pipe = pipesOnFile.get(name);
@@ -109,6 +124,14 @@ class PipesCfnProvisionerTest {
         }).when(pipes).deletePipe(anyString(), anyString());
     }
 
+    private Pipe pipeByArn(String arn) {
+        return pipesOnFile.values().stream()
+                .filter(pipe -> arn.equals(pipe.getArn()))
+                .findFirst()
+                .orElseThrow(() -> new AwsException("NotFoundException",
+                        "Resource " + arn + " does not exist.", 404));
+    }
+
     private static JsonNode props(String json) {
         try {
             return MAPPER.readTree(json);
@@ -132,6 +155,12 @@ class PipesCfnProvisionerTest {
         return """
                 {"Name": "%s", "Source": "%s", "Target": "%s", "RoleArn": "%s"}
                 """.formatted(name, source, target, ROLE_ARN);
+    }
+
+    private static String taggedPipeTemplate(String tagsJson) {
+        return """
+                {"Name": "MyPipe", "Source": "%s", "Target": "%s", "RoleArn": "%s", "Tags": %s}
+                """.formatted(SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN, ROLE_ARN, tagsJson);
     }
 
     @Test
@@ -207,6 +236,81 @@ class PipesCfnProvisionerTest {
     }
 
     /**
+     * A template with no Source is missing a required property, the same fault the create path
+     * reports. Diagnosing it as a replacement sends the reader after a change that never happened.
+     */
+    @Test
+    void anAbsentSourceOnUpdateReportsTheRequiredPropertyFault() {
+        provision(pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), null);
+
+        AwsException failure = assertThrows(AwsException.class, () -> provision("""
+                {"Name": "MyPipe", "Target": "%s", "RoleArn": "%s"}
+                """.formatted(TARGET_QUEUE_ARN, ROLE_ARN), "MyPipe"));
+
+        assertEquals("ValidationException", failure.getErrorCode());
+        assertEquals("Source is required", failure.getMessage());
+        assertEquals(400, failure.getHttpStatus());
+        verify(pipes, never()).updatePipe(anyString(), any(), any(), any(), any(), any(), any(), any(),
+                any(), anyString());
+    }
+
+    /** A Source that resolves blank is the same missing required property, not a changed Source. */
+    @Test
+    void aBlankSourceOnUpdateReportsTheRequiredPropertyFault() {
+        provision(pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), null);
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> provision(pipeTemplate("MyPipe", "", TARGET_QUEUE_ARN), "MyPipe"));
+
+        assertEquals("ValidationException", failure.getErrorCode());
+        assertEquals("Source is required", failure.getMessage());
+    }
+
+    @Test
+    void aChangedTagValueReachesThePipe() {
+        provision(taggedPipeTemplate("""
+                [{"Key": "Env", "Value": "dev"}]
+                """), null);
+
+        provision(taggedPipeTemplate("""
+                [{"Key": "Env", "Value": "prod"}]
+                """), "MyPipe");
+
+        verify(pipes).tagResource(REGION, "arn:aws:pipes:us-east-1:000000000000:pipe/MyPipe",
+                Map.of("Env", "prod"));
+        assertEquals(Map.of("Env", "prod"), pipesOnFile.get("MyPipe").getTags());
+    }
+
+    @Test
+    void aTagDroppedFromTheTemplateIsRemovedFromThePipe() {
+        provision(taggedPipeTemplate("""
+                [{"Key": "Env", "Value": "dev"}, {"Key": "Owner", "Value": "example-team"}]
+                """), null);
+
+        provision(taggedPipeTemplate("""
+                [{"Key": "Env", "Value": "dev"}]
+                """), "MyPipe");
+
+        verify(pipes).untagResource(REGION, "arn:aws:pipes:us-east-1:000000000000:pipe/MyPipe",
+                List.of("Owner"));
+        assertEquals(Map.of("Env", "dev"), pipesOnFile.get("MyPipe").getTags());
+    }
+
+    /**
+     * No tags on either side leaves the pipe's tags alone. The stored tags are still read, since a
+     * template that drops every tag has to have them removed.
+     */
+    @Test
+    void noTagsOnEitherSideMutatesNoTag() {
+        provision(pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), null);
+
+        provision(pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), "MyPipe");
+
+        verify(pipes, never()).tagResource(anyString(), anyString(), any());
+        verify(pipes, never()).untagResource(anyString(), anyString(), any());
+    }
+
+    /**
      * On a rename the replacement is created before the original is deleted, so a createPipe that
      * throws leaves the old pipe intact.
      */
@@ -253,6 +357,43 @@ class PipesCfnProvisionerTest {
         verify(pipes, never()).deletePipe(anyString(), anyString());
         assertEquals("true", r.getAttributes().get(CfnRollback.UPDATE_ROLLBACK_RESTORED_ATTR));
         assertEquals("MyPipe", r.getPhysicalId(), "the resource still points at the prior pipe");
+    }
+
+    /**
+     * The replacement is already on file by the time the old pipe is dropped, so a failing
+     * deletePipe must not fail the resource: propagating would leave the new pipe with no stack
+     * resource pointing at it and nothing to ever delete it.
+     */
+    @Test
+    void aFailedDeleteOfTheRenamedPipeStillCompletesTheUpdate() {
+        provision(pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), null);
+        doThrow(new RuntimeException("boom")).when(pipes).deletePipe("MyPipe", REGION);
+
+        StackResource renamed = provision(
+                pipeTemplate("MyRenamedPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), "MyPipe");
+
+        assertEquals("MyRenamedPipe", renamed.getPhysicalId(),
+                "the new pipe is still the resource's physical id");
+        assertEquals("arn:aws:pipes:us-east-1:000000000000:pipe/MyRenamedPipe",
+                renamed.getAttributes().get("Arn"));
+    }
+
+    /**
+     * Only a missing pipe falls back to the create arm. Any other describePipe failure reaches the
+     * user as itself, instead of being turned into ConflictException by a create that cannot work.
+     */
+    @Test
+    void anErrorOtherThanNotFoundFromDescribePipePropagates() {
+        provision(pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), null);
+        doThrow(new AwsException("InternalFailure", "storage is unavailable", 500))
+                .when(pipes).describePipe("MyPipe", REGION);
+
+        AwsException failure = assertThrows(AwsException.class, () -> provision(
+                pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), "MyPipe"));
+
+        assertEquals("InternalFailure", failure.getErrorCode());
+        assertEquals("storage is unavailable", failure.getMessage());
+        assertEquals(500, failure.getHttpStatus());
     }
 
     /** A pipe with no template Name keeps its generated physical name across updates. */
