@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -47,6 +48,9 @@ class PipesCfnProvisionerTest {
     private static final String SOURCE_QUEUE_ARN = "arn:aws:sqs:us-east-1:000000000000:example-queue";
     private static final String TARGET_QUEUE_ARN = "arn:aws:sqs:us-east-1:000000000000:example-target-queue";
     private static final String ROLE_ARN = "arn:aws:iam::000000000000:role/example-pipe-role";
+    private static final String NEW_TARGET_QUEUE_ARN = "arn:aws:sqs:us-east-1:000000000000:new-target-queue";
+    private static final String ENRICHMENT_ARN =
+            "arn:aws:lambda:us-east-1:000000000000:function:example-enrichment";
 
     private PipesService pipes;
     private PipesCfnProvisioner provisioner;
@@ -58,7 +62,7 @@ class PipesCfnProvisionerTest {
     @BeforeEach
     void setUp() {
         pipes = mock(PipesService.class);
-        provisioner = new PipesCfnProvisioner(pipes);
+        provisioner = new PipesCfnProvisioner(pipes, MAPPER);
         pipesOnFile = new LinkedHashMap<>();
 
         engine = mock(CloudFormationTemplateEngine.class);
@@ -79,6 +83,13 @@ class PipesCfnProvisionerTest {
             pipe.setArn("arn:aws:pipes:us-east-1:000000000000:pipe/" + name);
             pipe.setSource(i.getArgument(1));
             pipe.setTarget(i.getArgument(2));
+            pipe.setRoleArn(i.getArgument(3));
+            pipe.setDescription(i.getArgument(4));
+            pipe.setDesiredState(i.getArgument(5));
+            pipe.setEnrichment(i.getArgument(6));
+            pipe.setSourceParameters(i.getArgument(7));
+            pipe.setTargetParameters(i.getArgument(8));
+            pipe.setEnrichmentParameters(i.getArgument(9));
             Map<String, String> tags = i.getArgument(10);
             pipe.setTags(tags != null ? new HashMap<>(tags) : new HashMap<>());
             pipesOnFile.put(name, pipe);
@@ -110,9 +121,14 @@ class PipesCfnProvisionerTest {
             if (pipe == null) {
                 throw new AwsException("NotFoundException", "Pipe " + name + " does not exist.", 404);
             }
-            if (i.getArgument(1) != null) {
-                pipe.setTarget(i.getArgument(1));
-            }
+            applyIfPresent(i.getArgument(1), pipe::setTarget);
+            applyIfPresent(i.getArgument(2), pipe::setRoleArn);
+            applyIfPresent(i.getArgument(3), pipe::setDescription);
+            applyIfPresent(i.getArgument(4), pipe::setDesiredState);
+            applyIfPresent(i.getArgument(5), pipe::setEnrichment);
+            applyIfPresent(i.getArgument(6), pipe::setSourceParameters);
+            applyIfPresent(i.getArgument(7), pipe::setTargetParameters);
+            applyIfPresent(i.getArgument(8), pipe::setEnrichmentParameters);
             return pipe;
         });
         doAnswer(i -> {
@@ -122,6 +138,13 @@ class PipesCfnProvisionerTest {
             }
             return null;
         }).when(pipes).deletePipe(anyString(), anyString());
+    }
+
+    /** UpdatePipe reads an absent value as "leave this one alone", which the stub mirrors. */
+    private static <T> void applyIfPresent(T value, java.util.function.Consumer<T> setter) {
+        if (value != null) {
+            setter.accept(value);
+        }
     }
 
     private Pipe pipeByArn(String arn) {
@@ -140,12 +163,17 @@ class PipesCfnProvisionerTest {
         }
     }
 
-    private StackResource provision(String json, String priorPhysicalId) {
+    private static StackResource stackResource(String priorPhysicalId) {
         StackResource r = new StackResource();
         r.setLogicalId("MyPipe");
         r.setResourceType("AWS::Pipes::Pipe");
         r.setPhysicalId(priorPhysicalId);
         r.setAttributes(new HashMap<>());
+        return r;
+    }
+
+    private StackResource provision(String json, String priorPhysicalId) {
+        StackResource r = stackResource(priorPhysicalId);
         provisioner.provision(r, props(json),
                 new ProvisionContext(engine, REGION, ACCOUNT_ID, "TestStack", priorPhysicalId));
         return r;
@@ -161,6 +189,23 @@ class PipesCfnProvisionerTest {
         return """
                 {"Name": "MyPipe", "Source": "%s", "Target": "%s", "RoleArn": "%s", "Tags": %s}
                 """.formatted(SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN, ROLE_ARN, tagsJson);
+    }
+
+    /** Every property the update path can change, so a rollback has all of them to put back. */
+    private static String pipeTemplateWithEveryUpdatableProperty(String target, String description,
+                                                                 String tagsJson) {
+        return """
+                {"Name": "MyPipe", "Source": "%s", "Target": "%s", "RoleArn": "%s",
+                 "Description": "%s", "DesiredState": "STOPPED", "Enrichment": "%s",
+                 "TargetParameters": {"InputTemplate": "%s"}, "Tags": %s}
+                """.formatted(SOURCE_QUEUE_ARN, target, ROLE_ARN, description, ENRICHMENT_ARN,
+                description, tagsJson);
+    }
+
+    private static JsonNode targetParametersFor(String description) {
+        return props("""
+                {"InputTemplate": "%s"}
+                """.formatted(description));
     }
 
     @Test
@@ -341,11 +386,7 @@ class PipesCfnProvisionerTest {
         squatter.setName("MyRenamedPipe");
         pipesOnFile.put("MyRenamedPipe", squatter);
 
-        StackResource r = new StackResource();
-        r.setLogicalId("MyPipe");
-        r.setResourceType("AWS::Pipes::Pipe");
-        r.setPhysicalId("MyPipe");
-        r.setAttributes(new HashMap<>());
+        StackResource r = stackResource("MyPipe");
         JsonNode template = props(pipeTemplate("MyRenamedPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN));
         ProvisionContext ctx = new ProvisionContext(engine, REGION, ACCOUNT_ID, "TestStack", "MyPipe");
 
@@ -425,5 +466,80 @@ class PipesCfnProvisionerTest {
                 any(), anyString());
         assertEquals("MyPipe", r.getPhysicalId());
         assertNull(r.getAttributes().get(CfnRollback.UPDATE_ROLLBACK_RESTORED_ATTR));
+    }
+
+    /**
+     * updatePipe lands before the tag calls, so a tagResource that fails leaves the pipe carrying
+     * the new configuration under tags that are neither the old nor the new set. The rollback of
+     * the failed stack update puts the configuration and the tags back.
+     */
+    @Test
+    void aPipeMutatedByAFailedUpdateIsRestoredFromItsSnapshot() {
+        provision(pipeTemplateWithEveryUpdatableProperty(TARGET_QUEUE_ARN, "the first target", """
+                [{"Key": "Env", "Value": "dev"}, {"Key": "Owner", "Value": "example-team"}]
+                """), null);
+        doThrow(new AwsException("InternalFailure", "tagging is unavailable", 500))
+                .when(pipes).tagResource(anyString(), anyString(), eq(Map.of("Env", "prod")));
+
+        StackResource r = stackResource("MyPipe");
+        JsonNode template = props(pipeTemplateWithEveryUpdatableProperty(
+                NEW_TARGET_QUEUE_ARN, "the second target", """
+                        [{"Key": "Env", "Value": "prod"}]
+                        """));
+        ProvisionContext ctx = new ProvisionContext(engine, REGION, ACCOUNT_ID, "TestStack", "MyPipe");
+
+        assertThrows(AwsException.class, () -> provisioner.provision(r, template, ctx));
+        assertEquals(NEW_TARGET_QUEUE_ARN, pipesOnFile.get("MyPipe").getTarget(),
+                "the failed update already wrote the new target");
+        assertEquals(Map.of("Env", "dev"), pipesOnFile.get("MyPipe").getTags(),
+                "the failed update already dropped the Owner tag");
+
+        assertTrue(provisioner.rollbackUpdate(r));
+
+        verify(pipes).updatePipe("MyPipe", TARGET_QUEUE_ARN, ROLE_ARN, "the first target",
+                DesiredState.STOPPED, ENRICHMENT_ARN, null, targetParametersFor("the first target"),
+                null, REGION);
+        Pipe restored = pipesOnFile.get("MyPipe");
+        assertEquals(TARGET_QUEUE_ARN, restored.getTarget());
+        assertEquals("the first target", restored.getDescription());
+        assertEquals(targetParametersFor("the first target"), restored.getTargetParameters());
+        assertEquals(Map.of("Env", "dev", "Owner", "example-team"), restored.getTags());
+        assertNull(r.getAttributes().get(CfnRollback.PIPE_UPDATE_SNAPSHOT_ATTR),
+                "the snapshot is spent once the pipe is back");
+    }
+
+    /** A pipe this stack update never mutated has no snapshot, so there is nothing to put back. */
+    @Test
+    void aPipeThisUpdateNeverMutatedIsNotRolledBack() {
+        StackResource created = provision(
+                pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), null);
+
+        assertFalse(provisioner.rollbackUpdate(created));
+
+        verify(pipes, never()).updatePipe(anyString(), any(), any(), any(), any(), any(), any(),
+                any(), any(), anyString());
+    }
+
+    /**
+     * A snapshot describes the update in flight. The one a previous update left behind is dropped
+     * before this run decides whether it mutates the pipe, so a rollback never puts back a target
+     * the pipe stopped carrying two updates ago.
+     */
+    @Test
+    void anUpdateThatFailsBeforeMutatingThePipeRollsNothingBack() {
+        provision(pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), null);
+        StackResource updated = provision(
+                pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, NEW_TARGET_QUEUE_ARN), "MyPipe");
+
+        StackResource r = stackResource("MyPipe");
+        r.getAttributes().putAll(updated.getAttributes());
+        JsonNode template = props(pipeTemplate("MyPipe",
+                "arn:aws:sqs:us-east-1:000000000000:other-queue", NEW_TARGET_QUEUE_ARN));
+        ProvisionContext ctx = new ProvisionContext(engine, REGION, ACCOUNT_ID, "TestStack", "MyPipe");
+
+        assertThrows(AwsException.class, () -> provisioner.provision(r, template, ctx));
+
+        assertFalse(provisioner.rollbackUpdate(r));
+        assertEquals(NEW_TARGET_QUEUE_ARN, pipesOnFile.get("MyPipe").getTarget());
     }
 }

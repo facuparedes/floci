@@ -201,7 +201,7 @@ final class CfnProvisionerFixture {
                 discovered.add(new EcrCfnProvisioner(ecrService));
             }
             if (pipesService != null) {
-                discovered.add(new PipesCfnProvisioner(pipesService));
+                discovered.add(new PipesCfnProvisioner(pipesService, objectMapper));
             }
             if (firehoseService != null) {
                 discovered.add(new FirehoseCfnProvisioner(firehoseService));

@@ -28,6 +28,14 @@ public final class CfnRollback {
      */
     public static final String UPDATE_ROLLBACK_RESTORED_ATTR = "__FlociUpdateRollbackRestored";
 
+    /**
+     * Holds the configuration a pipe carried before the update in flight mutated it, so a failed
+     * stack update can put it back. Written by {@code PipesCfnProvisioner} before its first
+     * mutating call and spent by its {@code rollbackUpdate}. Lives here beside the other rollback
+     * markers rather than on the provisioner, so the marker names stay in one place.
+     */
+    public static final String PIPE_UPDATE_SNAPSHOT_ATTR = "__FlociPipeUpdateSnapshot";
+
     private CfnRollback() {
     }
 

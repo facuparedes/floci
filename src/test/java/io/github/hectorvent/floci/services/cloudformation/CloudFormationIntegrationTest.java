@@ -4284,6 +4284,111 @@ class CloudFormationIntegrationTest {
             """.formatted(targetLogicalId);
     }
 
+    /**
+     * CloudFormation rolls back every resource an update touched, not only the one that failed. A
+     * pipe reconciled in place before a later resource fails goes back to the target it carried,
+     * and the stack reaches UPDATE_ROLLBACK_COMPLETE instead of reporting the pipe as UPDATE_FAILED
+     * for want of a rollback.
+     */
+    @Test
+    void updateStack_laterFailureRestoresThePipeTarget() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "cfn-pipe-rollback-stack-" + suffix;
+        String pipeName = "cfn-pipe-rollback-pipe-" + suffix;
+        String failingSecret = """
+            ,
+                "BadSecret": {
+                  "Type": "AWS::SecretsManager::Secret",
+                  "DependsOn": "MyPipe",
+                  "Properties": {
+                    "Name": "cfn-pipe-rollback-secret-%s",
+                    "SecretString": "explicit",
+                    "GenerateSecretString": {"PasswordLength": 32}
+                  }
+                }""".formatted(suffix);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody",
+                    pipeRollbackTemplate(pipeName, "cfn-pipe-rollback-target-first", ""))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody",
+                    pipeRollbackTemplate(pipeName, "cfn-pipe-rollback-target-second", failingSecret))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_ROLLBACK_COMPLETE</StackStatus>"));
+
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/" + pipeName)
+        .then()
+            .statusCode(200)
+            .body("Target", equalTo("arn:aws:sqs:us-east-1:000000000000:cfn-pipe-rollback-target-first"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DeleteStack")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/" + pipeName)
+        .then()
+            .statusCode(404);
+    }
+
+    /**
+     * The pipe alone, addressing its queues by ARN. An AWS::SQS::Queue in the same stack would
+     * report UPDATE_FAILED for want of its own rollback and hide the pipe's outcome behind
+     * UPDATE_ROLLBACK_FAILED.
+     */
+    private static String pipeRollbackTemplate(String pipeName, String targetQueueName,
+                                               String failingResource) {
+        return """
+            {
+              "Resources": {
+                "MyPipe": {
+                  "Type": "AWS::Pipes::Pipe",
+                  "Properties": {
+                    "Name": "%1$s",
+                    "Source": "arn:aws:sqs:us-east-1:000000000000:cfn-pipe-rollback-source",
+                    "Target": "arn:aws:sqs:us-east-1:000000000000:%2$s",
+                    "RoleArn": "arn:aws:iam::000000000000:role/pipe-role",
+                    "DesiredState": "STOPPED"
+                  }
+                }%3$s
+              }
+            }
+            """.formatted(pipeName, targetQueueName, failingResource);
+    }
+
     // ── TemplateURL (path-style AWS S3) ──────────────────────────────────────
 
     @Test

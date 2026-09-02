@@ -1,12 +1,16 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.pipes.PipesService;
 import io.github.hectorvent.floci.services.pipes.model.DesiredState;
 import io.github.hectorvent.floci.services.pipes.model.Pipe;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.util.HashMap;
@@ -23,9 +27,12 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
     private static final int PIPE_NAME_MAX_LENGTH = 64;
 
     private final PipesService pipesService;
+    private final ObjectMapper objectMapper;
 
-    public PipesCfnProvisioner(PipesService pipesService) {
+    @Inject
+    public PipesCfnProvisioner(PipesService pipesService, ObjectMapper objectMapper) {
         this.pipesService = pipesService;
+        this.objectMapper = objectMapper;
     }
 
     @Override
@@ -35,6 +42,10 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
+        // A snapshot describes the update in flight. The one an earlier update left behind goes
+        // before this run decides whether it mutates the pipe at all, so a rollback never puts back
+        // a target the pipe stopped carrying two updates ago.
+        r.getAttributes().remove(CfnRollback.PIPE_UPDATE_SNAPSHOT_ATTR);
         String priorPhysicalId = ctx.priorPhysicalId();
         String name = ctx.stablePhysicalName(ctx.resolveOptional(props, "Name"),
                 r.getLogicalId(), PIPE_NAME_MAX_LENGTH, false);
@@ -63,7 +74,7 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
         Pipe existingPipe = ctx.reusesPriorEntity(name) ? pipeOnFile(name, ctx.region()) : null;
 
         Pipe pipe = existingPipe != null
-                ? updateExistingPipe(existingPipe, name, source, target, roleArn, description,
+                ? updateExistingPipe(r, existingPipe, name, source, target, roleArn, description,
                         desiredState, enrichment, sourceParameters, targetParameters,
                         enrichmentParameters, tags, ctx)
                 : createPipeAndDeleteRenamedPrior(r, name, source, target, roleArn, description,
@@ -76,11 +87,12 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
     }
 
     /** Reconciles the pipe already on file under this name, tags included. */
-    private Pipe updateExistingPipe(Pipe existingPipe, String name, String source, String target,
-                                    String roleArn, String description, DesiredState desiredState,
-                                    String enrichment, JsonNode sourceParameters,
-                                    JsonNode targetParameters, JsonNode enrichmentParameters,
-                                    Map<String, String> tags, ProvisionContext ctx) {
+    private Pipe updateExistingPipe(StackResource r, Pipe existingPipe, String name, String source,
+                                    String target, String roleArn, String description,
+                                    DesiredState desiredState, String enrichment,
+                                    JsonNode sourceParameters, JsonNode targetParameters,
+                                    JsonNode enrichmentParameters, Map<String, String> tags,
+                                    ProvisionContext ctx) {
         // A Source that is absent, null or resolves blank is a missing required property, not a
         // changed one. The create path reports it as such, so this path reports it identically
         // instead of blaming a replacement the template never asked for.
@@ -97,10 +109,88 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
             throw new AwsException("ValidationError",
                     "Updating Source requires resource replacement, which is not supported.", 400);
         }
+        snapshotPipeBeforeUpdate(r, existingPipe, ctx.region());
         Pipe pipe = pipesService.updatePipe(name, target, roleArn, description, desiredState,
                 enrichment, sourceParameters, targetParameters, enrichmentParameters, ctx.region());
         reconcileTags(pipe, tags, ctx.region());
         return pipe;
+    }
+
+    /**
+     * Records what the pipe carries before updatePipe and the tag calls change it, so
+     * {@link #rollbackUpdate} can put it back when the stack update fails. Only the properties
+     * updatePipe accepts, plus the tags: Name, Source and Arn cannot change on this path. The
+     * region travels with them because the rollback hook is handed the stack resource alone, and
+     * name plus region is how PipesService addresses a pipe.
+     */
+    private void snapshotPipeBeforeUpdate(StackResource r, Pipe existingPipe, String region) {
+        ObjectNode snapshot = objectMapper.createObjectNode();
+        snapshot.put("region", region);
+        snapshot.put("target", existingPipe.getTarget());
+        snapshot.put("roleArn", existingPipe.getRoleArn());
+        snapshot.put("description", existingPipe.getDescription());
+        snapshot.put("desiredState", existingPipe.getDesiredState() == null
+                ? null : existingPipe.getDesiredState().name());
+        snapshot.put("enrichment", existingPipe.getEnrichment());
+        snapshot.set("sourceParameters", existingPipe.getSourceParameters());
+        snapshot.set("targetParameters", existingPipe.getTargetParameters());
+        snapshot.set("enrichmentParameters", existingPipe.getEnrichmentParameters());
+        snapshot.set("tags", objectMapper.valueToTree(
+                existingPipe.getTags() == null ? Map.of() : existingPipe.getTags()));
+        r.getAttributes().put(CfnRollback.PIPE_UPDATE_SNAPSHOT_ATTR, snapshot.toString());
+    }
+
+    @Override
+    public boolean rollbackUpdate(StackResource resource) {
+        String rawSnapshot = resource.getAttributes().get(CfnRollback.PIPE_UPDATE_SNAPSHOT_ATTR);
+        if (rawSnapshot == null) {
+            return false;
+        }
+        try {
+            restoreSnapshottedPipe(resource, objectMapper.readTree(rawSnapshot));
+        } catch (JsonProcessingException unreadableSnapshot) {
+            throw new IllegalStateException("Could not read the pipe update snapshot for "
+                    + resource.getLogicalId(), unreadableSnapshot);
+        }
+        return true;
+    }
+
+    /**
+     * Puts the pipe back to the configuration the snapshot holds and spends the snapshot. Tags go
+     * through the same reconciliation the update uses.
+     *
+     * <p>A property the pipe had unset stays as the failed update wrote it: updatePipe reads a null
+     * as "leave this one alone", the same limit the update path itself works under.
+     */
+    private void restoreSnapshottedPipe(StackResource resource, JsonNode snapshot) {
+        String region = snapshot.get("region").asText();
+        String desiredState = snapshotText(snapshot, "desiredState");
+        Pipe restored = pipesService.updatePipe(resource.getPhysicalId(),
+                snapshotText(snapshot, "target"),
+                snapshotText(snapshot, "roleArn"),
+                snapshotText(snapshot, "description"),
+                desiredState == null ? null : DesiredState.valueOf(desiredState),
+                snapshotText(snapshot, "enrichment"),
+                snapshotValue(snapshot, "sourceParameters"),
+                snapshotValue(snapshot, "targetParameters"),
+                snapshotValue(snapshot, "enrichmentParameters"),
+                region);
+        Map<String, String> tags = new HashMap<>();
+        snapshot.path("tags").fields().forEachRemaining(
+                tag -> tags.put(tag.getKey(), tag.getValue().asText()));
+        reconcileTags(restored, tags, region);
+        resource.getAttributes().remove(CfnRollback.PIPE_UPDATE_SNAPSHOT_ATTR);
+    }
+
+    /** A snapshotted property, or null when the pipe carried none. */
+    private static JsonNode snapshotValue(JsonNode snapshot, String property) {
+        JsonNode value = snapshot.get(property);
+        return value == null || value.isNull() ? null : value;
+    }
+
+    private static String snapshotText(JsonNode snapshot, String property) {
+        JsonNode value = snapshotValue(snapshot, property);
+        return value == null ? null : value.asText();
     }
 
     /**

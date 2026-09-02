@@ -34,4 +34,14 @@ public interface CfnResourceProvisioner {
     default void delete(StackResource resource, String region) {
         delete(resource.getResourceType(), resource.getPhysicalId(), region);
     }
+
+    /**
+     * Puts the physical entity back to the configuration it had before the failed stack update
+     * that is now rolling back, and returns whether it did. Only a provisioner that snapshots
+     * that configuration before it mutates can answer true; {@code CloudFormationService} reports
+     * the resource as UPDATE_FAILED with "Rollback is not implemented" on false.
+     */
+    default boolean rollbackUpdate(StackResource resource) {
+        return false;
+    }
 }
