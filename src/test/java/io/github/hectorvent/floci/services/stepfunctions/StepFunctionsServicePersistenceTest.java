@@ -24,6 +24,7 @@ import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.verifyNoInteractions;
 
@@ -40,9 +41,6 @@ class StepFunctionsServicePersistenceTest {
             "arn:aws:states:us-east-1:000000000000:stateMachine:TestStateMachine";
     private static final double EPOCH_SECONDS_2023_11_14 = 1700000000.0;
     private static final double EPOCH_SECONDS_2100_01_01 = 4102444800.0;
-    private static final String ABANDONED_ERROR = "ExecutionAbandoned";
-    private static final String ABANDONED_CAUSE =
-            "The emulator restarted while this execution was RUNNING; no worker survived it.";
 
     private final AslExecutor aslExecutor = Mockito.mock(AslExecutor.class);
     private final SfnMockLoader mockLoader = Mockito.mock(SfnMockLoader.class);
@@ -59,10 +57,12 @@ class StepFunctionsServicePersistenceTest {
         StepFunctionsService afterRestart = serviceWithStorage(storage);
         afterRestart.abortAbandonedExecutions();
 
+        // The shape AWS returns for an execution stopped with no error and no cause: the status is
+        // the whole report, and error and cause are left off DescribeExecution and off the event.
         Execution reloaded = afterRestart.describeExecution(EXECUTION_ARN);
         assertEquals("ABORTED", reloaded.getStatus());
-        assertEquals(ABANDONED_ERROR, reloaded.getError());
-        assertEquals(ABANDONED_CAUSE, reloaded.getCause());
+        assertNull(reloaded.getError());
+        assertNull(reloaded.getCause());
         assertStopDateInEpochSeconds(reloaded.getStopDate());
 
         List<HistoryEvent> history = afterRestart.getExecutionHistory(EXECUTION_ARN);
@@ -71,8 +71,7 @@ class StepFunctionsServicePersistenceTest {
         assertEquals("ExecutionAborted", aborted.getType());
         assertEquals(1L, aborted.getId());
         assertEquals(Long.valueOf(0L), aborted.getPreviousEventId());
-        assertEquals(ABANDONED_ERROR, aborted.getDetails().get("error"));
-        assertEquals(ABANDONED_CAUSE, aborted.getDetails().get("cause"));
+        assertEquals(Map.of(), aborted.getDetails());
 
         verifyNoInteractions(aslExecutor, mockLoader, regionResolver);
     }
@@ -105,8 +104,8 @@ class StepFunctionsServicePersistenceTest {
                 executions.getForAccount(OTHER_ACCOUNT, OTHER_ACCOUNT_EXECUTION_ARN);
         assertTrue(owned.isPresent());
         assertEquals("ABORTED", owned.get().getStatus());
-        assertEquals(ABANDONED_ERROR, owned.get().getError());
-        assertEquals(ABANDONED_CAUSE, owned.get().getCause());
+        assertNull(owned.get().getError());
+        assertNull(owned.get().getCause());
         assertStopDateInEpochSeconds(owned.get().getStopDate());
         assertEquals(Optional.empty(),
                 executions.getForAccount(DEFAULT_ACCOUNT, OTHER_ACCOUNT_EXECUTION_ARN));
