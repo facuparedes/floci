@@ -1218,6 +1218,9 @@ class StepFunctionsValidateStateMachineDefinitionIntegrationTest {
     private static final String JSONATA_ONLY_FIELD_ON_A_JSONPATH_STATE =
             "The QueryLanguage is set to 'JSONPath', but field '%s' is only supported "
                     + "for the 'JSONata' QueryLanguage";
+    private static final String JSONPATH_ONLY_FIELD_ON_A_JSONATA_STATE =
+            "The QueryLanguage is set to 'JSONata', but field '%s' is only supported "
+                    + "for the 'JSONPath' QueryLanguage";
 
     /**
      * A Map's own QueryLanguage is inert for the states inside its ItemProcessor: on AWS the two
@@ -1234,14 +1237,25 @@ class StepFunctionsValidateStateMachineDefinitionIntegrationTest {
 
         Assertions.assertEquals(whenTheMapDeclaresNothing, whenTheMapDeclaresJsonata,
                 "the Map's QueryLanguage must not reach the states inside its ItemProcessor");
-        Assertions.assertEquals(1, whenTheMapDeclaresJsonata.size(),
-                "expected exactly one diagnostic, got " + whenTheMapDeclaresJsonata);
-        Map<String, Object> diagnostic = whenTheMapDeclaresJsonata.get(0);
-        Assertions.assertEquals("ERROR", diagnostic.get("severity"));
-        Assertions.assertEquals("SCHEMA_VALIDATION_FAILED", diagnostic.get("code"));
+        assertOutputRefusedOnTheItemProcessorPass(whenTheMapDeclaresJsonata, "the Map declares JSONata");
+        assertOutputRefusedOnTheItemProcessorPass(whenTheMapDeclaresNothing, "the Map declares nothing");
+    }
+
+    /**
+     * The literal shape both sides of the pair are held to. Asserted on each list separately, so
+     * neither side is pinned only by the other: two runs agreeing on the wrong answer is what the
+     * equality above cannot see.
+     */
+    private static void assertOutputRefusedOnTheItemProcessorPass(
+            List<Map<String, Object>> diagnostics, String when) {
+        Assertions.assertEquals(1, diagnostics.size(),
+                "expected exactly one diagnostic when " + when + ", got " + diagnostics);
+        Map<String, Object> diagnostic = diagnostics.get(0);
+        Assertions.assertEquals("ERROR", diagnostic.get("severity"), when);
+        Assertions.assertEquals("SCHEMA_VALIDATION_FAILED", diagnostic.get("code"), when);
         Assertions.assertEquals(JSONATA_ONLY_FIELD_ON_A_JSONPATH_STATE.formatted("Output"),
-                diagnostic.get("message"));
-        Assertions.assertEquals("/States/M/ItemProcessor/States/P", diagnostic.get("location"));
+                diagnostic.get("message"), when);
+        Assertions.assertEquals("/States/M/ItemProcessor/States/P", diagnostic.get("location"), when);
     }
 
     @Test
@@ -1558,6 +1572,112 @@ class StepFunctionsValidateStateMachineDefinitionIntegrationTest {
                 .body("diagnostics", hasSize(1))
                 .body("diagnostics[0].message", equalTo("Expected value of type [STRING]"))
                 .body("diagnostics[0].location", equalTo("/QueryLanguage"));
+    }
+
+    // ─────────── One state, two disallowed fields: the emission order is fixed ───────────
+    // The order below is not AWS-observable, it is the one this validator commits to. What matters
+    // is that it is the same on every JVM: a salted iteration order makes a maxResults=1 caller
+    // receive a different diagnostic on each run.
+
+    @Test
+    void twoJsonataOnlyFieldsOnAJsonPathStateEmitInTheOrderTheListDeclares() {
+        String def = """
+                {"StartAt":"T","States":{
+                  "T":{"Type":"Task","Resource":"arn:aws:states:::lambda:invoke",
+                    "Output":{"v":1},"Arguments":{"payload":"literal"},"End":true}}}
+                """;
+
+        validateDefinition(def)
+                .then().statusCode(200)
+                .body("result", equalTo("FAIL"))
+                .body("diagnostics", hasSize(2))
+                .body("diagnostics[0].message",
+                        equalTo(JSONATA_ONLY_FIELD_ON_A_JSONPATH_STATE.formatted("Output")))
+                .body("diagnostics[0].location", equalTo("/States/T"))
+                .body("diagnostics[1].message",
+                        equalTo(JSONATA_ONLY_FIELD_ON_A_JSONPATH_STATE.formatted("Arguments")))
+                .body("diagnostics[1].location", equalTo("/States/T"));
+    }
+
+    @Test
+    void threeJsonPathOnlyFieldsOnAJsonataStateEmitInTheOrderTheListDeclares() {
+        String def = """
+                {"QueryLanguage":"JSONata","StartAt":"X","States":{
+                  "X":{"Type":"Pass","InputPath":"$.a","OutputPath":"$.b","ResultPath":"$.c",
+                    "End":true}}}
+                """;
+
+        validateDefinition(def)
+                .then().statusCode(200)
+                .body("result", equalTo("FAIL"))
+                .body("diagnostics", hasSize(3))
+                .body("diagnostics[0].message",
+                        equalTo(JSONPATH_ONLY_FIELD_ON_A_JSONATA_STATE.formatted("InputPath")))
+                .body("diagnostics[1].message",
+                        equalTo(JSONPATH_ONLY_FIELD_ON_A_JSONATA_STATE.formatted("OutputPath")))
+                .body("diagnostics[2].message",
+                        equalTo(JSONPATH_ONLY_FIELD_ON_A_JSONATA_STATE.formatted("ResultPath")));
+    }
+
+    // ─────────── The legacy Iterator spelling, and a bare ItemProcessor Pass ───────────
+
+    /** Measured on AWS: Iterator carries no QueryLanguage either, and the location names Iterator. */
+    @Test
+    void legacyIteratorCannotDeclareQueryLanguage() {
+        String def = """
+                {"StartAt":"M","States":{
+                  "M":{"Type":"Map",
+                    "Iterator":{"QueryLanguage":"JSONata","StartAt":"P",
+                      "States":{"P":{"Type":"Pass","End":true}}},
+                    "End":true}}}
+                """;
+
+        validateDefinition(def)
+                .then().statusCode(200)
+                .body("result", equalTo("FAIL"))
+                .body("diagnostics", hasSize(1))
+                .body("diagnostics[0].code", equalTo("SCHEMA_VALIDATION_FAILED"))
+                .body("diagnostics[0].message", equalTo("Field 'QueryLanguage' is not supported"))
+                .body("diagnostics[0].location", equalTo("/States/M/Iterator"));
+    }
+
+    /** The control: the same Iterator without the field is accepted, as AWS accepts it. */
+    @Test
+    void legacyIteratorWithoutQueryLanguageIsAccepted() {
+        String def = """
+                {"StartAt":"M","States":{
+                  "M":{"Type":"Map",
+                    "Iterator":{"StartAt":"P","States":{"P":{"Type":"Pass","End":true}}},
+                    "End":true}}}
+                """;
+
+        validateDefinition(def)
+                .then().statusCode(200)
+                .body("result", equalTo("OK"))
+                .body("diagnostics", hasSize(0));
+    }
+
+    /**
+     * A JSONata machine, a Map declaring nothing, an ItemProcessor Pass declaring nothing and
+     * carrying Output: the inner state inherits the machine's JSONata, so AWS accepts it. The
+     * mirror of {@link #mapDeclaringJsonataLeavesItsItemProcessorStateOnTheMachinesJsonPath} from
+     * the other side of the two-level rule.
+     */
+    @Test
+    void jsonataMachineAcceptsOutputOnABareItemProcessorPass() {
+        String def = """
+                {"QueryLanguage":"JSONata","StartAt":"M","States":{
+                  "M":{"Type":"Map",
+                    "ItemProcessor":{"StartAt":"P","States":{
+                      "P":{"Type":"Pass","Output":{"doubled":"{% $states.input.n * 2 %}"},
+                        "End":true}}},
+                    "End":true}}}
+                """;
+
+        validateDefinition(def)
+                .then().statusCode(200)
+                .body("result", equalTo("OK"))
+                .body("diagnostics", hasSize(0));
     }
 
     private static String mapOverAPassCarryingOutput(String mapQueryLanguage) {
