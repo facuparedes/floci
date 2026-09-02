@@ -62,6 +62,10 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     private static final Set<String> JSONPATH_ONLY_FIELDS = Set.of(
             "InputPath", "OutputPath", "ResultPath", "ResultSelector", "Parameters", "Result", "ItemsPath",
             "MaxConcurrencyPath");
+    // Fields that are valid only in JSONata mode. Validated against real AWS: a JSONPath state
+    // carrying any of them returns SCHEMA_VALIDATION_FAILED. Assign is deliberately absent — AWS
+    // accepts it on a JSONPath state, so it belongs to neither list.
+    private static final Set<String> JSONATA_ONLY_FIELDS = Set.of("Output", "Arguments", "Items");
     // A {% %} string in one of these ASL fields is not an expression on AWS: Comment, Next,
     // Default and Resource keep it as text, ErrorEquals and Retry hold error names and integers,
     // ReaderConfig.CSVHeaders holds literal column names, and the JSONata support of
@@ -1152,7 +1156,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             "Pass", "Task", "Choice", "Wait", "Succeed", "Fail", "Parallel", "Map");
     private static final String PARSE_ERROR_MARKER = "INVALID_JSON_DESCRIPTION:";
     private static final String UNSUPPORTED_JSONATA_MARKER = "UNSUPPORTED_JSONATA_EXPRESSION:";
-    private static final String UNSUPPORTED_FIELD_MARKER = "UNSUPPORTED_FIELD:";
+    // The diagnostics AWS points at the state itself. Every other schema error is located at the
+    // offending field, so these travel with their message already composed and their own location.
+    private static final String STATE_LOCATED_MARKER = "STATE_LOCATED:";
     private static final String MISSING_END_STATE_MARKER = "MISSING_END_STATE:";
     private static final String UNREACHABLE_STATE_MARKER = "UNREACHABLE_STATE:";
     // Payload is "<value><SOH><location>", shared by every marker that must carry structured data
@@ -1243,8 +1249,11 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             return new Diagnostic("ERROR", "INVALID_JSONATA_EXPRESSION",
                     payload.substring(0, separator), payload.substring(separator + 1));
         }
-        if (error.startsWith(UNSUPPORTED_FIELD_MARKER)) {
-            return toUnsupportedFieldDiagnostic(error.substring(UNSUPPORTED_FIELD_MARKER.length()));
+        if (error.startsWith(STATE_LOCATED_MARKER)) {
+            String payload = error.substring(STATE_LOCATED_MARKER.length());
+            int separator = payload.indexOf(MARKER_PAYLOAD_SEPARATOR);
+            return new Diagnostic("ERROR", "SCHEMA_VALIDATION_FAILED",
+                    payload.substring(0, separator), payload.substring(separator + 1));
         }
         if (error.equals(MISSING_END_STATE_MARKER)) {
             return new Diagnostic("ERROR", "MISSING_END_STATE", "Workflow has no terminal state", null);
@@ -1287,16 +1296,6 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         }
         return new Diagnostic("ERROR", code,
                 message.substring(0, locationMatcher.start()).trim(), locationMatcher.group(1));
-    }
-
-    // Payload is "<field name> <location>"; unlike the generic schema-error shape, AWS points this
-    // diagnostic at the state itself rather than appending the field name to the location.
-    private static Diagnostic toUnsupportedFieldDiagnostic(String payload) {
-        int separator = payload.indexOf(' ');
-        String field = payload.substring(0, separator);
-        String location = payload.substring(separator + 1);
-        return new Diagnostic("ERROR", "SCHEMA_VALIDATION_FAILED",
-                "Field '" + field + "' is not supported", location);
     }
 
     private static void validateStateMachineName(String name) {
@@ -1724,7 +1723,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
                                                       String stateType, List<String> errors) {
         for (FieldStateTypeRule rule : FIELDS_ALLOWED_STATE_TYPES) {
             if (stateDef.has(rule.field()) && !rule.allowedTypes().contains(stateType)) {
-                errors.add(UNSUPPORTED_FIELD_MARKER + rule.field() + " " + statePath);
+                errors.add(STATE_LOCATED_MARKER + "Field '" + rule.field() + "' is not supported"
+                        + MARKER_PAYLOAD_SEPARATOR + statePath);
             }
         }
     }
@@ -1758,14 +1758,19 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         validateFieldsAllowedForType(statePath, stateDef, stateType, errors);
         validateTransitionTargets(statePath, stateDef, siblingStateNames, errors);
 
-        // JSONPath-only fields are not allowed when the state uses JSONata
-        if (stateIsJsonata) {
-            for (String field : JSONPATH_ONLY_FIELDS) {
-                if (stateDef.has(field)) {
-                    errors.add("The QueryLanguage is set to 'JSONata', but field '" + field
-                            + "' is only supported for the 'JSONPath' QueryLanguage at " + statePath);
-                }
+        // A field belonging to the other query language is refused on both sides. AWS reports this
+        // family at the state, never at the offending field, which is why it carries its location.
+        Set<String> fieldsOfTheOtherLanguage = stateIsJsonata ? JSONPATH_ONLY_FIELDS : JSONATA_ONLY_FIELDS;
+        String otherLanguage = stateIsJsonata ? "JSONPath" : "JSONata";
+        for (String field : fieldsOfTheOtherLanguage) {
+            if (stateDef.has(field)) {
+                errors.add(STATE_LOCATED_MARKER + "The QueryLanguage is set to '"
+                        + (stateIsJsonata ? "JSONata" : "JSONPath") + "', but field '" + field
+                        + "' is only supported for the '" + otherLanguage + "' QueryLanguage"
+                        + MARKER_PAYLOAD_SEPARATOR + statePath);
             }
+        }
+        if (stateIsJsonata) {
             collectTopLevelReferences(statePath, stateDef, errors);
         }
 
