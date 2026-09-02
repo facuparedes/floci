@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -17,7 +18,11 @@ import java.util.logging.LogRecord;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * A resource type Floci has no provisioner for is stubbed: a synthetic physical id, an
@@ -40,6 +45,8 @@ class CloudFormationUnsupportedResourceTypeTest {
     private static final String STUB_REASON =
             "Resource type AWS::Fake::Thing is not supported by Floci. "
                     + "It was stubbed and nothing was created for it.";
+    private static final String STRICT_REASON =
+            "Resource type AWS::Fake::Thing is not supported by Floci.";
     private static final String STUB_WARNING =
             "Stubbing unsupported resource type AWS::Fake::Thing (MyThing): nothing is created for it. "
                     + "Set floci.services.cloudformation.allow-stub-unsupported-resource-types=false "
@@ -80,6 +87,31 @@ class CloudFormationUnsupportedResourceTypeTest {
     }
 
     @Test
+    void unsupportedTypeFailsTheResourceWhenTheStubIsDisallowed() {
+        StackResource resource = provisionerWithStubAllowed(false)
+                .provision(LOGICAL_ID, UNSUPPORTED_TYPE, props(), engine(),
+                        REGION, ACCOUNT_ID, STACK_NAME);
+
+        assertEquals("CREATE_FAILED", resource.getStatus());
+        assertEquals(STRICT_REASON, resource.getStatusReason());
+        // The failure precedes the synthetic physical id, so Cloud Control's own "no physical id"
+        // branch reports the same message instead of a success over a resource that is not there.
+        assertNull(resource.getPhysicalId());
+    }
+
+    @Test
+    void absentConfigMeansTheDocumentedDefault() {
+        // A provisioner built in a unit test carries no config, and the knob defaults to true, so
+        // absent config has to mean the lenient behaviour. Reading it the other way round makes
+        // every config-less provisioner strict.
+        StackResource resource = provisionUnsupported();
+
+        assertEquals("CREATE_COMPLETE", resource.getStatus());
+        assertEquals(STUB_REASON, resource.getStatusReason());
+        assertNotNull(resource.getPhysicalId());
+    }
+
+    @Test
     void deleteOfUnsupportedTypeDoesNotThrow() {
         List<LogRecord> logged = new CopyOnWriteArrayList<>();
 
@@ -92,6 +124,17 @@ class CloudFormationUnsupportedResourceTypeTest {
                         r.getLevel().intValue() >= Level.WARNING.intValue()
                                 && DELETE_WARNING.equals(formatted(r))),
                 "expected the skipped delete to be reported at warn, got: " + rendered(logged));
+    }
+
+    private CloudFormationResourceProvisioner provisionerWithStubAllowed(boolean allowed) {
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.CloudFormationServiceConfig cloudformation =
+                mock(EmulatorConfig.CloudFormationServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.cloudformation()).thenReturn(cloudformation);
+        when(cloudformation.allowStubUnsupportedResourceTypes()).thenReturn(allowed);
+        return CfnProvisionerFixture.builder().objectMapper(mapper).config(config).build();
     }
 
     private StackResource provisionUnsupported() {
