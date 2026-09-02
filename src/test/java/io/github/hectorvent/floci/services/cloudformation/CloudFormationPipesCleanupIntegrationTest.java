@@ -120,6 +120,8 @@ class CloudFormationPipesCleanupIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("<PhysicalResourceId>" + oldName + "</PhysicalResourceId>"))
+            .body(containsString(
+                    "<ResourceStatus>UPDATE_COMPLETE_CLEANUP_IN_PROGRESS</ResourceStatus>"))
             .body(containsString("<ResourceStatus>DELETE_IN_PROGRESS</ResourceStatus>"))
             .body(containsString("<ResourceStatus>DELETE_COMPLETE</ResourceStatus>"))
             .body(not(containsString("<ResourceStatus>DELETE_FAILED</ResourceStatus>")));
