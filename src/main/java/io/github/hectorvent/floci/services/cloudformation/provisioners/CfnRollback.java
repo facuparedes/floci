@@ -36,6 +36,14 @@ public final class CfnRollback {
      */
     public static final String PIPE_UPDATE_SNAPSHOT_ATTR = "__FlociPipeUpdateSnapshot";
 
+    /**
+     * Holds the pipe a rename displaced: the name it still lives under, the region that addresses
+     * it, and how many times deleting it has been attempted. Written by {@code PipesCfnProvisioner}
+     * when it creates the replacement and spent by its {@code completeUpdate}, which deletes that
+     * pipe once the stack update has committed.
+     */
+    public static final String PIPE_RENAME_CLEANUP_ATTR = "__FlociPipeRenameCleanup";
+
     private CfnRollback() {
     }
 

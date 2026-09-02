@@ -44,8 +44,10 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
         // A snapshot describes the update in flight. The one an earlier update left behind goes
         // before this run decides whether it mutates the pipe at all, so a rollback never puts back
-        // a target the pipe stopped carrying two updates ago.
+        // a target the pipe stopped carrying two updates ago. The rename cleanup goes with it: only
+        // a rename this run performs owes a pipe deleted after the update commits.
         r.getAttributes().remove(CfnRollback.PIPE_UPDATE_SNAPSHOT_ATTR);
+        r.getAttributes().remove(CfnRollback.PIPE_RENAME_CLEANUP_ATTR);
         String priorPhysicalId = ctx.priorPhysicalId();
         String name = ctx.stablePhysicalName(ctx.resolveOptional(props, "Name"),
                 r.getLogicalId(), PIPE_NAME_MAX_LENGTH, false);
@@ -77,7 +79,7 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
                 ? updateExistingPipe(r, existingPipe, name, source, target, roleArn, description,
                         desiredState, enrichment, sourceParameters, targetParameters,
                         enrichmentParameters, tags, ctx)
-                : createPipeAndDeleteRenamedPrior(r, name, source, target, roleArn, description,
+                : createPipeAndRecordRenamedPrior(r, name, source, target, roleArn, description,
                         desiredState, enrichment, sourceParameters, targetParameters,
                         enrichmentParameters, tags, priorPhysicalId, ctx);
 
@@ -195,11 +197,15 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
     }
 
     /**
-     * Creates the pipe, and on a rename deletes the pipe the prior deploy left under the old name.
-     * The replacement is created first, so a createPipe that throws leaves the original intact and
-     * the resource is marked as already restored: rollback does not restore what was never deleted.
+     * Creates the pipe, and on a rename records the pipe the prior deploy left under the old name
+     * so {@link #completeUpdate} deletes it once the stack update has committed. Nothing is deleted
+     * here: the prior pipe outlives this call, which is what lets a rollback of a later resource
+     * failure still find it.
+     *
+     * <p>A createPipe that throws therefore leaves the original intact, and the resource is marked
+     * as already restored: rollback does not restore what was never deleted.
      */
-    private Pipe createPipeAndDeleteRenamedPrior(StackResource r, String name, String source,
+    private Pipe createPipeAndRecordRenamedPrior(StackResource r, String name, String source,
                                                  String target, String roleArn, String description,
                                                  DesiredState desiredState, String enrichment,
                                                  JsonNode sourceParameters, JsonNode targetParameters,
@@ -216,21 +222,102 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
                     ctx.region());
         } catch (RuntimeException failure) {
             if (preservedPriorPipe != null) {
+                // The prior pipe is untouched: the rename records its deletion for the committed
+                // update cleanup, which this failure means the stack never reaches.
                 r.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_RESTORED_ATTR, "true");
             }
             throw failure;
         }
         if (preservedPriorPipe != null) {
-            try {
-                pipesService.deletePipe(priorPhysicalId, ctx.region());
-            } catch (RuntimeException cleanupFailure) {
-                // The replacement is already on file. Propagating here would leave it with no stack
-                // resource pointing at it, so nothing would ever delete it.
-                LOG.warnv(cleanupFailure, "Failed to delete renamed pipe {0} after replacement by {1}",
-                        priorPhysicalId, name);
-            }
+            recordRenamedPriorPipe(r, priorPhysicalId, ctx.region());
         }
         return pipe;
+    }
+
+    /**
+     * Records the pipe this rename displaced, with the region that addresses it and the attempt
+     * count {@link #completeUpdate} carries across its retries.
+     */
+    private void recordRenamedPriorPipe(StackResource r, String priorPhysicalId, String region) {
+        ObjectNode cleanup = objectMapper.createObjectNode();
+        cleanup.put("priorPipeName", priorPhysicalId);
+        cleanup.put("region", region);
+        cleanup.put("cleanupAttempts", 0);
+        r.getAttributes().put(CfnRollback.PIPE_RENAME_CLEANUP_ATTR, cleanup.toString());
+    }
+
+    @Override
+    public String updateCleanupPhysicalId(StackResource resource) {
+        if ("Retain".equals(resource.getUpdateReplacePolicy())) {
+            return null;
+        }
+        JsonNode cleanup = renameCleanup(resource);
+        return cleanup == null ? null : cleanup.path("priorPipeName").asText(null);
+    }
+
+    @Override
+    public boolean hasReplacementUpdate(StackResource resource) {
+        JsonNode cleanup = renameCleanup(resource);
+        return cleanup != null && cleanup.path("priorPipeName").asText(null) != null;
+    }
+
+    @Override
+    public void clearUpdate(StackResource resource) {
+        resource.getAttributes().remove(CfnRollback.PIPE_RENAME_CLEANUP_ATTR);
+    }
+
+    /**
+     * Deletes the pipe the rename displaced, one attempt per call, now that the stack update has
+     * committed. The attempt count and the last failure are written back onto the resource, so the
+     * caller's retries pick up where this one left off.
+     */
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        JsonNode cleanup = renameCleanup(resource);
+        if (cleanup == null) {
+            return UpdateCleanupResult.notApplicable();
+        }
+        String priorPipeName = cleanup.path("priorPipeName").asText(null);
+        String region = cleanup.path("region").asText(null);
+        if (priorPipeName == null || priorPipeName.equals(resource.getPhysicalId())) {
+            return new UpdateCleanupResult(true, true, priorPipeName, 0, null);
+        }
+        if ("Retain".equals(resource.getUpdateReplacePolicy())) {
+            return new UpdateCleanupResult(true, true, priorPipeName, 0, null);
+        }
+
+        int attempts = cleanup.path("cleanupAttempts").asInt(0);
+        String failureReason = cleanup.path("cleanupFailureReason").asText(null);
+        if (attempts >= 3) {
+            return new UpdateCleanupResult(true, false, priorPipeName, attempts, failureReason);
+        }
+        try {
+            if (pipeOnFile(priorPipeName, region) != null) {
+                pipesService.deletePipe(priorPipeName, region);
+            }
+            return new UpdateCleanupResult(true, true, priorPipeName, attempts, null);
+        } catch (RuntimeException deleteFailure) {
+            attempts++;
+            ((ObjectNode) cleanup).put("cleanupAttempts", attempts);
+            ((ObjectNode) cleanup).put("cleanupFailureReason", deleteFailure.getMessage());
+            resource.getAttributes().put(CfnRollback.PIPE_RENAME_CLEANUP_ATTR, cleanup.toString());
+            return new UpdateCleanupResult(
+                    true, false, priorPipeName, attempts, deleteFailure.getMessage());
+        }
+    }
+
+    /** The rename cleanup recorded on this resource, or null when no rename displaced a pipe. */
+    private JsonNode renameCleanup(StackResource resource) {
+        String rawCleanup = resource.getAttributes().get(CfnRollback.PIPE_RENAME_CLEANUP_ATTR);
+        if (rawCleanup == null) {
+            return null;
+        }
+        try {
+            return objectMapper.readTree(rawCleanup);
+        } catch (JsonProcessingException unreadableCleanup) {
+            throw new IllegalStateException("Could not read the pipe rename cleanup for "
+                    + resource.getLogicalId(), unreadableCleanup);
+        }
     }
 
     /**

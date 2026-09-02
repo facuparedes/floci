@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.cloudformation.model.TemplateSummary;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnRollback;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.UpdateCleanupResult;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -1307,8 +1308,7 @@ public class CloudFormationService implements ResourceProvider {
                         null);
             }
             while (true) {
-                CloudFormationResourceProvisioner.UpdateCleanupResult result =
-                        provisioner.completeUpdate(resource);
+                UpdateCleanupResult result = provisioner.completeUpdate(resource);
                 if (!result.applicable()) {
                     break;
                 }

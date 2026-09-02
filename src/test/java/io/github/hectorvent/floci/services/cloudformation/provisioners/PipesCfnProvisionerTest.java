@@ -30,6 +30,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -375,23 +376,67 @@ class PipesCfnProvisionerTest {
     }
 
     /**
-     * On a rename the replacement is created before the original is deleted, so a createPipe that
-     * throws leaves the old pipe intact.
+     * On a rename provision creates the replacement and records the pipe left under the old name,
+     * which is deleted only once the stack update commits and completeUpdate runs.
      */
     @Test
-    void aRenameCreatesTheReplacementBeforeDeletingTheOriginal() {
+    void aRenameCreatesTheReplacementAndLeavesTheOriginalToTheCommittedCleanup() {
         provision(pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), null);
 
         StackResource renamed = provision(
                 pipeTemplate("MyRenamedPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), "MyPipe");
 
+        verify(pipes).createPipe(eq("MyRenamedPipe"), any(), any(), any(), any(), any(), any(),
+                any(), any(), any(), any(), any());
+        verify(pipes, never()).deletePipe(anyString(), anyString());
+        assertTrue(pipesOnFile.containsKey("MyPipe"), "the prior pipe outlives provision");
+        assertEquals("MyRenamedPipe", renamed.getPhysicalId());
+        assertEquals("arn:aws:pipes:us-east-1:000000000000:pipe/MyRenamedPipe",
+                renamed.getAttributes().get("Arn"));
+
+        assertTrue(provisioner.hasReplacementUpdate(renamed));
+        assertEquals("MyPipe", provisioner.updateCleanupPhysicalId(renamed));
+
+        UpdateCleanupResult cleanup = provisioner.completeUpdate(renamed);
+
         InOrder order = inOrder(pipes);
         order.verify(pipes).createPipe(eq("MyRenamedPipe"), any(), any(), any(), any(), any(), any(),
                 any(), any(), any(), any(), any());
         order.verify(pipes).deletePipe("MyPipe", REGION);
-        assertEquals("MyRenamedPipe", renamed.getPhysicalId());
-        assertEquals("arn:aws:pipes:us-east-1:000000000000:pipe/MyRenamedPipe",
-                renamed.getAttributes().get("Arn"));
+        assertEquals(new UpdateCleanupResult(true, true, "MyPipe", 0, null), cleanup);
+        assertFalse(pipesOnFile.containsKey("MyPipe"), "the prior pipe is gone once cleanup runs");
+
+        provisioner.clearUpdate(renamed);
+        assertFalse(provisioner.hasReplacementUpdate(renamed),
+                "the cleanup record is spent once the prior pipe is gone");
+    }
+
+    /** A pipe kept by UpdateReplacePolicy Retain is not deleted when the rename cleanup runs. */
+    @Test
+    void aRetainedPriorPipeSurvivesTheCommittedCleanup() {
+        provision(pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), null);
+        StackResource renamed = provision(
+                pipeTemplate("MyRenamedPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), "MyPipe");
+        renamed.setUpdateReplacePolicy("Retain");
+
+        assertNull(provisioner.updateCleanupPhysicalId(renamed));
+        assertEquals(new UpdateCleanupResult(true, true, "MyPipe", 0, null),
+                provisioner.completeUpdate(renamed));
+        verify(pipes, never()).deletePipe(anyString(), anyString());
+        assertTrue(pipesOnFile.containsKey("MyPipe"));
+    }
+
+    /** A pipe with no rename behind it owes no cleanup, so the caller moves on to the next one. */
+    @Test
+    void aPipeNoRenameDisplacedOwesNoCleanup() {
+        StackResource created = provision(
+                pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), null);
+
+        assertFalse(provisioner.hasReplacementUpdate(created));
+        assertNull(provisioner.updateCleanupPhysicalId(created));
+        assertEquals(new UpdateCleanupResult(false, true, null, 0, null),
+                provisioner.completeUpdate(created));
+        verify(pipes, never()).deletePipe(anyString(), anyString());
     }
 
     /**
@@ -421,11 +466,11 @@ class PipesCfnProvisionerTest {
 
     /**
      * The replacement is already on file by the time the old pipe is dropped, so a failing
-     * deletePipe must not fail the resource: propagating would leave the new pipe with no stack
-     * resource pointing at it and nothing to ever delete it.
+     * deletePipe must not fail the resource: the update stays committed and the failure is reported
+     * one attempt at a time, until the caller gives up on the third and names the pipe left behind.
      */
     @Test
-    void aFailedDeleteOfTheRenamedPipeStillCompletesTheUpdate() {
+    void aFailedDeleteOfTheRenamedPipeReportsEachAttemptAndKeepsTheUpdate() {
         provision(pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), null);
         doThrow(new RuntimeException("boom")).when(pipes).deletePipe("MyPipe", REGION);
 
@@ -436,6 +481,32 @@ class PipesCfnProvisionerTest {
                 "the new pipe is still the resource's physical id");
         assertEquals("arn:aws:pipes:us-east-1:000000000000:pipe/MyRenamedPipe",
                 renamed.getAttributes().get("Arn"));
+
+        assertEquals(new UpdateCleanupResult(true, false, "MyPipe", 1, "boom"),
+                provisioner.completeUpdate(renamed));
+        assertEquals(new UpdateCleanupResult(true, false, "MyPipe", 2, "boom"),
+                provisioner.completeUpdate(renamed));
+        assertEquals(new UpdateCleanupResult(true, false, "MyPipe", 3, "boom"),
+                provisioner.completeUpdate(renamed));
+        assertEquals(new UpdateCleanupResult(true, false, "MyPipe", 3, "boom"),
+                provisioner.completeUpdate(renamed),
+                "a fourth call reports the same give-up without another delete");
+
+        verify(pipes, times(3)).deletePipe("MyPipe", REGION);
+        assertTrue(pipesOnFile.containsKey("MyPipe"), "the pipe the rename displaced is left behind");
+    }
+
+    /** A prior pipe already deleted out of band leaves the cleanup nothing to do. */
+    @Test
+    void aPriorPipeAlreadyGoneCompletesTheCleanupWithoutADelete() {
+        provision(pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), null);
+        StackResource renamed = provision(
+                pipeTemplate("MyRenamedPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), "MyPipe");
+        pipesOnFile.remove("MyPipe");
+
+        assertEquals(new UpdateCleanupResult(true, true, "MyPipe", 0, null),
+                provisioner.completeUpdate(renamed));
+        verify(pipes, never()).deletePipe(anyString(), anyString());
     }
 
     /**
