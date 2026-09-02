@@ -357,8 +357,9 @@ only on `Task`, `Parallel` and `Map`.
 
 ## A state's QueryLanguage, and the fields it may carry
 
-A state's query language is its own `QueryLanguage` field, or the state machine's when it declares
-none. That is the whole resolution: a state inside a `Map`'s `ItemProcessor` or `Iterator`, or
+A state's query language is JSONPath when its `QueryLanguage` field is exactly the string
+`"JSONPath"`, the state machine's when the field is absent, and JSONata for any other value: the
+wrong case, an unknown string and a non-string alike. A state inside a `Map`'s `ItemProcessor` or `Iterator`, or
 inside one of a `Parallel`'s `Branches`, falls back to the **state machine's** language and not to
 the enclosing `Map`'s or `Parallel`'s, which the Amazon States Language calls independent of it. The
 enclosing state's own fields, `Items` and `MaxConcurrency` among them, do use its own language.
@@ -380,8 +381,9 @@ Three more refusals, each measured against `ValidateStateMachineDefinition` on r
 
 A `QueryLanguage` value outside the enum is reported at the field, `/States/X/QueryLanguage` or
 `/QueryLanguage`, with `Value should be one of the following: [JSONPath, JSONata]`, and a
-non-string value with `Expected value of type [STRING]`. The effective language is still resolved
-case-insensitively, so `"jsonata"` is a JSONata state that also carries that diagnostic.
+non-string value with `Expected value of type [STRING]`. That diagnostic is independent of the
+resolution above, so `"jsonpath"` is a JSONata state that also carries it, and it is not a
+downgrade: only the exact string `"JSONPath"` under a JSONata machine is.
 
 Locations follow AWS: the two messages above point at the state, `/States/X`, while every other
 schema error points at the offending field, `/States/X/MaxConcurrency`.

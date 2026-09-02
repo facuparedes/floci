@@ -72,7 +72,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     // the list above, which the same expression selects between.
     private static final List<String> JSONATA_ONLY_FIELDS = List.of("Output", "Arguments", "Items");
     // The two spellings AWS accepts in a QueryLanguage field, exactly as written here. Any other
-    // value is reported against this enum, including a case AWS still resolves such as "jsonata".
+    // value is reported against this enum, including one AWS still resolves to JSONata such as
+    // "jsonata" or "jsonpath".
     private static final Set<String> QUERY_LANGUAGES = Set.of("JSONPath", "JSONata");
     // A {% %} string in one of these ASL fields is not an expression on AWS: Comment, Next,
     // Default and Resource keep it as text, ErrorEquals and Retry hold error names and integers,
@@ -1614,7 +1615,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             return errors;
         }
 
-        boolean topLevelJsonata = resolvesToJsonata(def.path("QueryLanguage").asText(null), false);
+        boolean topLevelJsonata = resolvesToJsonata(def, false);
 
         Set<String> topLevelStateNames = new HashSet<>();
         states.fieldNames().forEachRemaining(topLevelStateNames::add);
@@ -1760,21 +1761,24 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     }
 
     /**
-     * The effective query language of one state, or of the state machine when {@code declared} is
-     * the top-level field. AWS resolves the spelling case-insensitively, so a state declaring
-     * {@code "jsonata"} is a JSONata state for every field check. A value that is neither language
-     * keeps the inherited one: calling it JSONPath would put a language the definition never wrote
-     * into the diagnostic. The spelling itself is reported by
-     * {@link #validateQueryLanguageValue}, which runs whatever this resolves to.
+     * The effective query language of one state, or of the state machine when {@code owner} is the
+     * definition itself. Measured against real AWS: the language is JSONPath only when the field is
+     * exactly the string {@code "JSONPath"}. Absent, it is inherited; present and anything else,
+     * the wrong case, an unknown string and a non-string alike, the owner is JSONata. The spelling
+     * is reported separately by {@link #validateQueryLanguageValue}, which runs whatever this
+     * resolves to.
      */
-    private static boolean resolvesToJsonata(String declared, boolean inheritedJsonata) {
-        if ("JSONata".equalsIgnoreCase(declared)) {
-            return true;
+    private static boolean resolvesToJsonata(JsonNode owner, boolean inheritedJsonata) {
+        JsonNode declared = owner.path("QueryLanguage");
+        if (declared.isMissingNode()) {
+            return inheritedJsonata;
         }
-        if ("JSONPath".equalsIgnoreCase(declared)) {
-            return false;
-        }
-        return inheritedJsonata;
+        return !declaresJsonPath(owner);
+    }
+
+    /** The exact string that is the one way to ask for JSONPath, and the one trigger of the downgrade. */
+    private static boolean declaresJsonPath(JsonNode owner) {
+        return "JSONPath".equals(owner.path("QueryLanguage").asText(null));
     }
 
     /**
@@ -1823,12 +1827,11 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
                 || stateDef.path("Choices").isEmpty())) {
             errors.add("Choice state must declare a non-empty field 'Choices' at " + statePath);
         }
-        String stateQL = stateDef.path("QueryLanguage").asText(null);
-        boolean stateIsJsonata = resolvesToJsonata(stateQL, topLevelJsonata);
+        boolean stateIsJsonata = resolvesToJsonata(stateDef, topLevelJsonata);
 
         // A JSONata state machine cannot be reverted to JSONPath one state at a time. The upgrade
         // in the other direction is allowed, which is why this reads the machine's language.
-        boolean downgradedToJsonPath = topLevelJsonata && "JSONPath".equalsIgnoreCase(stateQL);
+        boolean downgradedToJsonPath = topLevelJsonata && declaresJsonPath(stateDef);
         if (downgradedToJsonPath) {
             errors.add(EXPLICIT_LOCATION_MARKER + "'QueryLanguage' can not be 'JSONPath' if set to "
                     + "'JSONata' for whole state machine" + MARKER_PAYLOAD_SEPARATOR + statePath);
