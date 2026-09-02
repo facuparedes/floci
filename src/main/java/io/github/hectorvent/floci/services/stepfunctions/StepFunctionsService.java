@@ -66,6 +66,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     // carrying any of them returns SCHEMA_VALIDATION_FAILED. Assign is deliberately absent — AWS
     // accepts it on a JSONPath state, so it belongs to neither list.
     private static final Set<String> JSONATA_ONLY_FIELDS = Set.of("Output", "Arguments", "Items");
+    // The two spellings AWS accepts in a QueryLanguage field, exactly as written here. Any other
+    // value is reported against this enum, including a case AWS still resolves such as "jsonata".
+    private static final Set<String> QUERY_LANGUAGES = Set.of("JSONPath", "JSONata");
     // A {% %} string in one of these ASL fields is not an expression on AWS: Comment, Next,
     // Default and Resource keep it as text, ErrorEquals and Retry hold error names and integers,
     // ReaderConfig.CSVHeaders holds literal column names, and the JSONata support of
@@ -1156,9 +1159,11 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             "Pass", "Task", "Choice", "Wait", "Succeed", "Fail", "Parallel", "Map");
     private static final String PARSE_ERROR_MARKER = "INVALID_JSON_DESCRIPTION:";
     private static final String UNSUPPORTED_JSONATA_MARKER = "UNSUPPORTED_JSONATA_EXPRESSION:";
-    // The diagnostics AWS points at the state itself. Every other schema error is located at the
-    // offending field, so these travel with their message already composed and their own location.
-    private static final String STATE_LOCATED_MARKER = "STATE_LOCATED:";
+    // The diagnostics whose location AWS does not compose from the offending field name: the
+    // QueryLanguage compatibility family, which it points at the state, and the QueryLanguage enum
+    // error, which it points at the field. Every other schema error has "/<field>" appended to the
+    // state path, so these travel with their message already composed and their own location.
+    private static final String EXPLICIT_LOCATION_MARKER = "EXPLICIT_LOCATION:";
     private static final String MISSING_END_STATE_MARKER = "MISSING_END_STATE:";
     private static final String UNREACHABLE_STATE_MARKER = "UNREACHABLE_STATE:";
     // Payload is "<value><SOH><location>", shared by every marker that must carry structured data
@@ -1249,8 +1254,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             return new Diagnostic("ERROR", "INVALID_JSONATA_EXPRESSION",
                     payload.substring(0, separator), payload.substring(separator + 1));
         }
-        if (error.startsWith(STATE_LOCATED_MARKER)) {
-            String payload = error.substring(STATE_LOCATED_MARKER.length());
+        if (error.startsWith(EXPLICIT_LOCATION_MARKER)) {
+            String payload = error.substring(EXPLICIT_LOCATION_MARKER.length());
             int separator = payload.indexOf(MARKER_PAYLOAD_SEPARATOR);
             return new Diagnostic("ERROR", "SCHEMA_VALIDATION_FAILED",
                     payload.substring(0, separator), payload.substring(separator + 1));
@@ -1596,14 +1601,15 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             errors.add("The field 'StartAt' is required and must be a non-empty string");
         }
 
+        validateQueryLanguageValue(def, "/QueryLanguage", errors);
+
         JsonNode states = def.get("States");
         if (states == null || !states.isObject() || states.isEmpty()) {
             errors.add("The field 'States' is required and must be a non-empty object");
             return errors;
         }
 
-        String topLevelQL = def.path("QueryLanguage").asText("JSONPath");
-        boolean topLevelJsonata = "JSONata".equals(topLevelQL);
+        boolean topLevelJsonata = resolvesToJsonata(def.path("QueryLanguage").asText(null), false);
 
         Set<String> topLevelStateNames = new HashSet<>();
         states.fieldNames().forEachRemaining(topLevelStateNames::add);
@@ -1723,9 +1729,69 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
                                                       String stateType, List<String> errors) {
         for (FieldStateTypeRule rule : FIELDS_ALLOWED_STATE_TYPES) {
             if (stateDef.has(rule.field()) && !rule.allowedTypes().contains(stateType)) {
-                errors.add(STATE_LOCATED_MARKER + "Field '" + rule.field() + "' is not supported"
+                errors.add(EXPLICIT_LOCATION_MARKER + "Field '" + rule.field() + "' is not supported"
                         + MARKER_PAYLOAD_SEPARATOR + statePath);
             }
+        }
+    }
+
+    /**
+     * A field belonging to the other query language is refused on both sides. AWS reports this
+     * family at the state, never at the offending field, which is why it carries its location.
+     */
+    private static void reportFieldsOfTheOtherLanguage(String statePath, JsonNode stateDef,
+                                                       boolean stateIsJsonata, List<String> errors) {
+        Collection<String> fieldsOfTheOtherLanguage =
+                stateIsJsonata ? JSONPATH_ONLY_FIELDS : JSONATA_ONLY_FIELDS;
+        String otherLanguage = stateIsJsonata ? "JSONPath" : "JSONata";
+        for (String field : fieldsOfTheOtherLanguage) {
+            if (stateDef.has(field)) {
+                errors.add(EXPLICIT_LOCATION_MARKER + "The QueryLanguage is set to '"
+                        + (stateIsJsonata ? "JSONata" : "JSONPath") + "', but field '" + field
+                        + "' is only supported for the '" + otherLanguage + "' QueryLanguage"
+                        + MARKER_PAYLOAD_SEPARATOR + statePath);
+            }
+        }
+    }
+
+    /**
+     * The effective query language of one state, or of the state machine when {@code declared} is
+     * the top-level field. AWS resolves the spelling case-insensitively, so a state declaring
+     * {@code "jsonata"} is a JSONata state for every field check. A value that is neither language
+     * keeps the inherited one: calling it JSONPath would put a language the definition never wrote
+     * into the diagnostic. The spelling itself is reported by
+     * {@link #validateQueryLanguageValue}, which runs whatever this resolves to.
+     */
+    private static boolean resolvesToJsonata(String declared, boolean inheritedJsonata) {
+        if ("JSONata".equalsIgnoreCase(declared)) {
+            return true;
+        }
+        if ("JSONPath".equalsIgnoreCase(declared)) {
+            return false;
+        }
+        return inheritedJsonata;
+    }
+
+    /**
+     * Reports a declared {@code QueryLanguage} against AWS's enum. Measured on real AWS: this one
+     * is located at the field, {@code /States/X/QueryLanguage} or {@code /QueryLanguage}, and not at
+     * the state like the compatibility messages, and it is returned on top of whatever the resolved
+     * language produced.
+     */
+    private static void validateQueryLanguageValue(JsonNode owner, String location,
+                                                   List<String> errors) {
+        JsonNode declared = owner.path("QueryLanguage");
+        if (declared.isMissingNode()) {
+            return;
+        }
+        if (!declared.isTextual()) {
+            errors.add(EXPLICIT_LOCATION_MARKER + "Expected value of type [STRING]"
+                    + MARKER_PAYLOAD_SEPARATOR + location);
+            return;
+        }
+        if (!QUERY_LANGUAGES.contains(declared.asText())) {
+            errors.add(EXPLICIT_LOCATION_MARKER + "Value should be one of the following: "
+                    + "[JSONPath, JSONata]" + MARKER_PAYLOAD_SEPARATOR + location);
         }
     }
 
@@ -1753,30 +1819,26 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             errors.add("Choice state must declare a non-empty field 'Choices' at " + statePath);
         }
         String stateQL = stateDef.path("QueryLanguage").asText(null);
-        boolean stateIsJsonata = stateQL != null ? "JSONata".equals(stateQL) : topLevelJsonata;
+        boolean stateIsJsonata = resolvesToJsonata(stateQL, topLevelJsonata);
 
         // A JSONata state machine cannot be reverted to JSONPath one state at a time. The upgrade
         // in the other direction is allowed, which is why this reads the machine's language.
-        if (topLevelJsonata && "JSONPath".equals(stateQL)) {
-            errors.add(STATE_LOCATED_MARKER + "'QueryLanguage' can not be 'JSONPath' if set to "
+        boolean downgradedToJsonPath = topLevelJsonata && "JSONPath".equalsIgnoreCase(stateQL);
+        if (downgradedToJsonPath) {
+            errors.add(EXPLICIT_LOCATION_MARKER + "'QueryLanguage' can not be 'JSONPath' if set to "
                     + "'JSONata' for whole state machine" + MARKER_PAYLOAD_SEPARATOR + statePath);
         }
 
         validateFieldsAllowedForType(statePath, stateDef, stateType, errors);
         validateTransitionTargets(statePath, stateDef, siblingStateNames, errors);
 
-        // A field belonging to the other query language is refused on both sides. AWS reports this
-        // family at the state, never at the offending field, which is why it carries its location.
-        Set<String> fieldsOfTheOtherLanguage = stateIsJsonata ? JSONPATH_ONLY_FIELDS : JSONATA_ONLY_FIELDS;
-        String otherLanguage = stateIsJsonata ? "JSONPath" : "JSONata";
-        for (String field : fieldsOfTheOtherLanguage) {
-            if (stateDef.has(field)) {
-                errors.add(STATE_LOCATED_MARKER + "The QueryLanguage is set to '"
-                        + (stateIsJsonata ? "JSONata" : "JSONPath") + "', but field '" + field
-                        + "' is only supported for the '" + otherLanguage + "' QueryLanguage"
-                        + MARKER_PAYLOAD_SEPARATOR + statePath);
-            }
+        // Measured on AWS: the downgrade is the whole answer for that state, and the fields its
+        // refused language forbids are not named on top of it. Only this check is skipped; every
+        // other one, the Map's MaxConcurrency range among them, still runs.
+        if (!downgradedToJsonPath) {
+            reportFieldsOfTheOtherLanguage(statePath, stateDef, stateIsJsonata, errors);
         }
+        validateQueryLanguageValue(stateDef, statePath + "/QueryLanguage", errors);
         if (stateIsJsonata) {
             collectTopLevelReferences(statePath, stateDef, errors);
         }
@@ -1914,7 +1976,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
                                      boolean inheritedJsonata, List<String> errors) {
         // A sub-workflow is not a state and declares no query language of its own.
         if (subWorkflow.has("QueryLanguage")) {
-            errors.add(STATE_LOCATED_MARKER + "Field 'QueryLanguage' is not supported"
+            errors.add(EXPLICIT_LOCATION_MARKER + "Field 'QueryLanguage' is not supported"
                     + MARKER_PAYLOAD_SEPARATOR + subWorkflowPath);
         }
         JsonNode states = subWorkflow.path("States");
