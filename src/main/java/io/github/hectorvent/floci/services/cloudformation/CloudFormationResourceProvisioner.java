@@ -374,7 +374,12 @@ public class CloudFormationResourceProvisioner {
 
     /**
      * Provisions a single resource. Returns the populated StackResource (physicalId + attributes set).
-     * Returns null and logs a warning for unsupported types.
+     *
+     * <p>A resource type with no provisioner is stubbed: a synthetic physical id, an
+     * {@code arn:aws:stub:::} ARN attribute and {@code CREATE_COMPLETE}, logged at warn and
+     * carrying a status reason saying nothing was created. With
+     * {@code floci.services.cloudformation.allow-stub-unsupported-resource-types} off it comes back
+     * {@code CREATE_FAILED} instead, with no physical id.
      */
     public StackResource provision(String logicalId, String resourceType, JsonNode properties,
                                    CloudFormationTemplateEngine engine, String region, String accountId,
