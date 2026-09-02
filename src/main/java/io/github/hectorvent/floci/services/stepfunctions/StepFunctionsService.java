@@ -82,12 +82,6 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             "arn:aws:states:::s3:listObjectsV2");
     private static final Set<String> ITEM_READER_INPUT_TYPES = Set.of(
             "MANIFEST", "JSON", "CSV", "JSONL", "PARQUET");
-    // What an execution abandoned by a restart reports. AWS documents error and cause on
-    // StopExecution as free-form caller strings, so this name takes no States. prefix, which is a
-    // namespace AWS reserves for state-machine errors.
-    private static final String ABANDONED_ERROR = "ExecutionAbandoned";
-    private static final String ABANDONED_CAUSE =
-            "The emulator restarted while this execution was RUNNING; no worker survived it.";
     private static final String RESULT_WRITER_RESOURCE = "arn:aws:states:::s3:putObject";
     private static final Set<String> RESULT_WRITER_TRANSFORMATIONS = Set.of("NONE", "COMPACT", "FLATTEN");
     private static final Set<String> RESULT_WRITER_OUTPUT_TYPES = Set.of("JSON", "JSONL");
@@ -708,12 +702,15 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
      * <p>Scans every account and writes each execution back under the account that owns it: startup
      * has no request context, so the account-scoped accessors would silently cover only the
      * configured default account.
+     *
+     * <p>Aborts with no error and no cause, the shape AWS returns for StopExecution called without
+     * them: the status is the whole report. The WARN below is where the reason lives.
      */
     public void abortAbandonedExecutions() {
         int abandonedCount = 0;
         for (AccountAwareStorageBackend.AccountEntry<Execution> entry
                 : executionStore.scanAllAccountEntries(key -> true)) {
-            if (!markAborted(entry.key(), entry.value(), ABANDONED_ERROR, ABANDONED_CAUSE)) {
+            if (!markAborted(entry.key(), entry.value(), null, null)) {
                 continue;
             }
             executionStore.putForAccount(entry.accountId(), entry.key(), entry.value());
