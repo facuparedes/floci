@@ -1348,6 +1348,93 @@ class StepFunctionsValidateStateMachineDefinitionIntegrationTest {
                 .body("diagnostics", hasSize(0));
     }
 
+    // A JSONata state machine cannot be reverted to JSONPath state by state, and the ItemProcessor
+    // or branch object is not a state: it carries no QueryLanguage of its own. Both measured.
+
+    @Test
+    void stateCannotDeclareJsonPathUnderAJsonataStateMachine() {
+        String def = """
+                {"QueryLanguage":"JSONata","StartAt":"M","States":{
+                  "M":{"Type":"Map","QueryLanguage":"JSONPath",
+                    "ItemProcessor":{"StartAt":"P","States":{"P":{"Type":"Pass","End":true}}},
+                    "End":true}}}
+                """;
+
+        validateDefinition(def)
+                .then().statusCode(200)
+                .body("result", equalTo("FAIL"))
+                .body("diagnostics", hasSize(1))
+                .body("diagnostics[0].severity", equalTo("ERROR"))
+                .body("diagnostics[0].code", equalTo("SCHEMA_VALIDATION_FAILED"))
+                .body("diagnostics[0].message", equalTo("'QueryLanguage' can not be 'JSONPath' "
+                        + "if set to 'JSONata' for whole state machine"))
+                .body("diagnostics[0].location", equalTo("/States/M"));
+    }
+
+    /** The guard reads the machine's language, not the mere presence of the field. */
+    @Test
+    void stateMayDeclareJsonPathUnderAJsonPathStateMachine() {
+        String def = """
+                {"StartAt":"X","States":{
+                  "X":{"Type":"Pass","QueryLanguage":"JSONPath","InputPath":"$.a","End":true}}}
+                """;
+
+        validateDefinition(def)
+                .then().statusCode(200)
+                .body("result", equalTo("OK"))
+                .body("diagnostics", hasSize(0));
+    }
+
+    @Test
+    void stateMayDeclareJsonataUnderAJsonataStateMachine() {
+        String def = """
+                {"QueryLanguage":"JSONata","StartAt":"X","States":{
+                  "X":{"Type":"Pass","QueryLanguage":"JSONata","Output":{"v":"{% 1 %}"},"End":true}}}
+                """;
+
+        validateDefinition(def)
+                .then().statusCode(200)
+                .body("result", equalTo("OK"))
+                .body("diagnostics", hasSize(0));
+    }
+
+    @Test
+    void itemProcessorCannotDeclareQueryLanguage() {
+        String def = """
+                {"StartAt":"M","States":{
+                  "M":{"Type":"Map",
+                    "ItemProcessor":{"QueryLanguage":"JSONata","StartAt":"P",
+                      "States":{"P":{"Type":"Pass","End":true}}},
+                    "End":true}}}
+                """;
+
+        validateDefinition(def)
+                .then().statusCode(200)
+                .body("result", equalTo("FAIL"))
+                .body("diagnostics", hasSize(1))
+                .body("diagnostics[0].code", equalTo("SCHEMA_VALIDATION_FAILED"))
+                .body("diagnostics[0].message", equalTo("Field 'QueryLanguage' is not supported"))
+                .body("diagnostics[0].location", equalTo("/States/M/ItemProcessor"));
+    }
+
+    @Test
+    void parallelBranchCannotDeclareQueryLanguage() {
+        String def = """
+                {"StartAt":"PAR","States":{
+                  "PAR":{"Type":"Parallel",
+                    "Branches":[{"QueryLanguage":"JSONata","StartAt":"P",
+                      "States":{"P":{"Type":"Pass","End":true}}}],
+                    "End":true}}}
+                """;
+
+        validateDefinition(def)
+                .then().statusCode(200)
+                .body("result", equalTo("FAIL"))
+                .body("diagnostics", hasSize(1))
+                .body("diagnostics[0].message", equalTo("Field 'QueryLanguage' is not supported"))
+                .body("diagnostics[0].location", equalTo("/States/PAR/Branches[0]"));
+    }
+
     private static String mapOverAPassCarryingOutput(String mapQueryLanguage) {
         return """
                 {"QueryLanguage":"JSONPath","StartAt":"M","States":{
