@@ -1904,8 +1904,11 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
 
     /**
      * Validates a Map's {@code ItemProcessor} or {@code Iterator}, or one of a Parallel's
-     * {@code Branches}. {@code inheritedJsonata} is the state machine's query language: the
-     * enclosing Map or Parallel state's own declaration governs only its own fields.
+     * {@code Branches}. {@code inheritedJsonata} is the state machine's query language: a state in
+     * here that declares none defaults to the machine's and not to the enclosing Map's or
+     * Parallel's, which the ASL specification calls independent of it.
+     *
+     * @see <a href="https://states-language.net/spec.html">Amazon States Language, QueryLanguage</a>
      */
     private void validateSubWorkflow(JsonNode subWorkflow, String subWorkflowPath,
                                      boolean inheritedJsonata, List<String> errors) {
