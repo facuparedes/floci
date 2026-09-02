@@ -774,10 +774,11 @@ public class CloudFormationResourceProvisioner {
             case "AWS::CloudFront::Distribution" -> cloudFrontService.removeDistribution(physicalId);
             // Warn for the same reason the create path does: the delete reports success over a
             // type nothing here removes, and at debug that is invisible at the default log level.
-            // The create switch provisions types this one does not delete, so the line names the
-            // physical id left live in the service's store instead of claiming nothing was created.
-            default -> LOG.warnv("No delete implemented for resource type {0}: leaving {1} in "
-                    + "place.", resourceType, physicalId);
+            // The line names the physical id without claiming a resource survives it: this arm
+            // takes both a type the create switch provisioned and one it only stubbed, and only
+            // the first leaves something behind.
+            default -> LOG.warnv("No delete implemented for resource type {0}: {1} is not removed "
+                    + "here.", resourceType, physicalId);
         }
     }
 

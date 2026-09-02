@@ -53,7 +53,7 @@ class CloudFormationUnsupportedResourceTypeTest {
                     + "to fail the stack instead.";
     private static final String DELETE_WARNING =
             "No delete implemented for resource type AWS::Fake::Thing: "
-                    + "leaving MyThing-11a79dff in place.";
+                    + "MyThing-11a79dff is not removed here.";
 
     private final ObjectMapper mapper = new ObjectMapper();
     private CloudFormationResourceProvisioner provisioner;
