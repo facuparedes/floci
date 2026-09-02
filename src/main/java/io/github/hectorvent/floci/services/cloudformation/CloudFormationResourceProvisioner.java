@@ -517,7 +517,18 @@ public class CloudFormationResourceProvisioner {
                                 + resourceType + " — remove its LEGACY_SWITCH_TYPES entry when it "
                                 + "moves to a per-service provisioner.");
                     } else {
-                        LOG.debugv("Stubbing unsupported resource type: {0} ({1})", resourceType, logicalId);
+                        // Warn, not debug, and a status reason on the resource: the stub reports
+                        // CREATE_COMPLETE while creating nothing, so without both the stack is
+                        // indistinguishable from one where every resource was really provisioned.
+                        // The reason reaches DescribeStackEvents through the event
+                        // CloudFormationService already builds from it.
+                        LOG.warnv("Stubbing unsupported resource type {0} ({1}): nothing is created "
+                                        + "for it. Set floci.services.cloudformation."
+                                        + "allow-stub-unsupported-resource-types=false to fail the "
+                                        + "stack instead.",
+                                resourceType, logicalId);
+                        resource.setStatusReason(unsupportedResourceTypeMessage(resourceType)
+                                + " It was stubbed and nothing was created for it.");
                         resource.setPhysicalId(logicalId + "-" + UUID.randomUUID().toString().substring(0, 8));
                         resource.getAttributes().put("Arn", "arn:aws:stub:::" + logicalId);
                     }
@@ -530,6 +541,11 @@ public class CloudFormationResourceProvisioner {
             resource.setStatusReason(e.getMessage());
         }
         return resource;
+    }
+
+    /** The one sentence Floci says about a resource type it has no provisioner for. */
+    static String unsupportedResourceTypeMessage(String resourceType) {
+        return "Resource type " + resourceType + " is not supported by Floci.";
     }
 
     /**
@@ -735,7 +751,10 @@ public class CloudFormationResourceProvisioner {
             case "AWS::AutoScaling::AutoScalingGroup" ->
                     autoScalingService.deleteAutoScalingGroup(region, physicalId, true);
             case "AWS::CloudFront::Distribution" -> cloudFrontService.removeDistribution(physicalId);
-            default -> LOG.debugv("Skipping delete of unsupported resource type: {0}", resourceType);
+            // Warn for the same reason the create path does: the delete reports success over a
+            // type nothing here removes, and at debug that is invisible at the default log level.
+            default -> LOG.warnv("Skipping delete of unsupported resource type {0}: nothing was "
+                    + "created for it.", resourceType);
         }
     }
 
