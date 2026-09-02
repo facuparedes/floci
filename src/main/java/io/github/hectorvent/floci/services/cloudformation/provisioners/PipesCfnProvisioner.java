@@ -159,13 +159,14 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
      * Puts the pipe back to the configuration the snapshot holds and spends the snapshot. Tags go
      * through the same reconciliation the update uses.
      *
-     * <p>A property the pipe had unset stays as the failed update wrote it: updatePipe reads a null
-     * as "leave this one alone", the same limit the update path itself works under.
+     * <p>The snapshot holds the whole configuration, so a property the pipe did not carry is
+     * cleared: restorePipe writes every property as the snapshot has it, and what the failed update
+     * added does not survive the rollback.
      */
     private void restoreSnapshottedPipe(StackResource resource, JsonNode snapshot) {
         String region = snapshot.get("region").asText();
         String desiredState = snapshotText(snapshot, "desiredState");
-        Pipe restored = pipesService.updatePipe(resource.getPhysicalId(),
+        Pipe restored = pipesService.restorePipe(resource.getPhysicalId(),
                 snapshotText(snapshot, "target"),
                 snapshotText(snapshot, "roleArn"),
                 snapshotText(snapshot, "description"),

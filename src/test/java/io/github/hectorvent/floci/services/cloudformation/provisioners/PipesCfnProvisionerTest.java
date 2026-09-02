@@ -131,6 +131,25 @@ class PipesCfnProvisionerTest {
             applyIfPresent(i.getArgument(8), pipe::setEnrichmentParameters);
             return pipe;
         });
+        // restorePipe writes every property as given, clearing the ones passed as null; only the
+        // desired state is left alone when unset, since currentState is read off it.
+        when(pipes.restorePipe(anyString(), any(), any(), any(), any(), any(), any(), any(), any(),
+                anyString())).thenAnswer(i -> {
+            String name = i.getArgument(0);
+            Pipe pipe = pipesOnFile.get(name);
+            if (pipe == null) {
+                throw new AwsException("NotFoundException", "Pipe " + name + " does not exist.", 404);
+            }
+            pipe.setTarget(i.getArgument(1));
+            pipe.setRoleArn(i.getArgument(2));
+            pipe.setDescription(i.getArgument(3));
+            applyIfPresent(i.<DesiredState>getArgument(4), pipe::setDesiredState);
+            pipe.setEnrichment(i.getArgument(5));
+            pipe.setSourceParameters(i.getArgument(6));
+            pipe.setTargetParameters(i.getArgument(7));
+            pipe.setEnrichmentParameters(i.getArgument(8));
+            return pipe;
+        });
         doAnswer(i -> {
             String name = i.getArgument(0);
             if (pipesOnFile.remove(name) == null) {
@@ -496,7 +515,7 @@ class PipesCfnProvisionerTest {
 
         assertTrue(provisioner.rollbackUpdate(r));
 
-        verify(pipes).updatePipe("MyPipe", TARGET_QUEUE_ARN, ROLE_ARN, "the first target",
+        verify(pipes).restorePipe("MyPipe", TARGET_QUEUE_ARN, ROLE_ARN, "the first target",
                 DesiredState.STOPPED, ENRICHMENT_ARN, null, targetParametersFor("the first target"),
                 null, REGION);
         Pipe restored = pipesOnFile.get("MyPipe");
@@ -516,7 +535,7 @@ class PipesCfnProvisionerTest {
 
         assertFalse(provisioner.rollbackUpdate(created));
 
-        verify(pipes, never()).updatePipe(anyString(), any(), any(), any(), any(), any(), any(),
+        verify(pipes, never()).restorePipe(anyString(), any(), any(), any(), any(), any(), any(),
                 any(), any(), anyString());
     }
 
