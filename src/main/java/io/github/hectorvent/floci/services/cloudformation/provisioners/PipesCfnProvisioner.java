@@ -81,10 +81,19 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
                                     String enrichment, JsonNode sourceParameters,
                                     JsonNode targetParameters, JsonNode enrichmentParameters,
                                     Map<String, String> tags, ProvisionContext ctx) {
+        // A Source that is absent, null or resolves blank is a missing required property, not a
+        // changed one. The create path reports it as such, so this path reports it identically
+        // instead of blaming a replacement the template never asked for.
+        if (source == null || source.isBlank()) {
+            throw new AwsException("ValidationException", "Source is required", 400);
+        }
         // Source is a createOnly property. With the name reused there is no replacement to move to,
         // which is the update CloudFormation refuses for a custom-named resource, so it is refused
-        // here rather than silently kept on the old source.
-        if (source != null && !source.equals(existingPipe.getSource())) {
+        // here rather than silently kept on the old source. The 13 create-only paths nested under
+        // SourceParameters (the StartingPosition, TopicName, QueueName, VirtualHost,
+        // ConsumerGroupID and AdditionalBootstrapServers entries) are reconciled in place, where
+        // AWS replaces the pipe. That gap is left to a later change.
+        if (!source.equals(existingPipe.getSource())) {
             throw new AwsException("ValidationError",
                     "Updating Source requires resource replacement, which is not supported.", 400);
         }
@@ -121,19 +130,34 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
             throw failure;
         }
         if (preservedPriorPipe != null) {
-            pipesService.deletePipe(priorPhysicalId, ctx.region());
+            try {
+                pipesService.deletePipe(priorPhysicalId, ctx.region());
+            } catch (RuntimeException cleanupFailure) {
+                // The replacement is already on file. Propagating here would leave it with no stack
+                // resource pointing at it, so nothing would ever delete it.
+                LOG.warnv(cleanupFailure, "Failed to delete renamed pipe {0} after replacement by {1}",
+                        priorPhysicalId, name);
+            }
         }
         return pipe;
     }
 
-    /** The pipe on file under this name, or null when it is not there. */
+    /**
+     * The pipe on file under this name, or null when it is not there. Only the not-found error
+     * yields null: any other failure reaches the user as itself, instead of sending the caller into
+     * the create arm to report ConflictException over an unrelated fault.
+     */
     private Pipe pipeOnFile(String name, String region) {
         try {
             return pipesService.describePipe(name, region);
-        } catch (AwsException notFound) {
+        } catch (AwsException lookupFailure) {
+            if (!"NotFoundException".equals(lookupFailure.getErrorCode())
+                    && lookupFailure.getHttpStatus() != 404) {
+                throw lookupFailure;
+            }
             // Expected when the pipe was deleted out of band since the prior deploy, and on the
             // rename arm when the prior pipe is already gone; both fall back to a plain create.
-            LOG.debugv(notFound, "No pipe {0} found on file", name);
+            LOG.debugv(lookupFailure, "No pipe {0} found on file", name);
             return null;
         }
     }
