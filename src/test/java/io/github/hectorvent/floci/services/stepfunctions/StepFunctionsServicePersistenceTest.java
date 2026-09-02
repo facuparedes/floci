@@ -11,10 +11,16 @@ import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.text.MessageFormat;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -76,7 +82,23 @@ class StepFunctionsServicePersistenceTest {
         executions.putForAccount(OTHER_ACCOUNT, OTHER_ACCOUNT_EXECUTION_ARN,
                 running(OTHER_ACCOUNT_EXECUTION_ARN));
 
-        serviceWithStorage(storage).abortAbandonedExecutions();
+        List<LogRecord> logRecords = new ArrayList<>();
+        Handler collector = collectorInto(logRecords);
+        Logger serviceLogger = Logger.getLogger(StepFunctionsService.class.getName());
+        serviceLogger.addHandler(collector);
+        try {
+            serviceWithStorage(storage).abortAbandonedExecutions();
+        } finally {
+            serviceLogger.removeHandler(collector);
+        }
+
+        // The level is compared by value: under JBoss LogManager the record carries its own WARN
+        // instance, not the java.util.logging constant.
+        assertTrue(logRecords.stream().anyMatch(record ->
+                        record.getLevel().intValue() == Level.WARNING.intValue()
+                        && formatted(record)
+                                .contains("Aborted 1 Step Functions execution(s) left RUNNING by a restart")),
+                "expected a WARN record naming how many executions the sweep aborted, got: " + logRecords);
 
         Optional<Execution> owned =
                 executions.getForAccount(OTHER_ACCOUNT, OTHER_ACCOUNT_EXECUTION_ARN);
@@ -121,6 +143,34 @@ class StepFunctionsServicePersistenceTest {
         assertEquals(1, afterRestart.getExecutionHistory(EXECUTION_ARN).size());
 
         verifyNoInteractions(aslExecutor, mockLoader, regionResolver);
+    }
+
+    private static Handler collectorInto(List<LogRecord> records) {
+        Handler collector = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        collector.setLevel(Level.ALL);
+        return collector;
+    }
+
+    /** The record as a reader sees it, whether the handler receives it formatted or as a pattern. */
+    private static String formatted(LogRecord record) {
+        Object[] parameters = record.getParameters();
+        if (parameters == null || parameters.length == 0) {
+            return String.valueOf(record.getMessage());
+        }
+        return MessageFormat.format(record.getMessage(), parameters);
     }
 
     private static Execution running(String executionArn) {

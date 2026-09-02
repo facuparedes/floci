@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -43,7 +44,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     private static final Logger LOG = Logger.getLogger(StepFunctionsService.class);
 
     private final StorageBackend<String, StateMachine> stateMachineStore;
-    private final StorageBackend<String, Execution> executionStore;
+    // Account-aware: the startup sweep has no request context and must reach every account.
+    private final AccountAwareStorageBackend<Execution> executionStore;
     private final StorageBackend<String, Activity> activityStore;
     private final StorageBackend<String, MapRun> mapRunStore;
     private final Map<String, ExecutionHistory> historyCache = new ConcurrentHashMap<>();
@@ -80,6 +82,12 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             "arn:aws:states:::s3:listObjectsV2");
     private static final Set<String> ITEM_READER_INPUT_TYPES = Set.of(
             "MANIFEST", "JSON", "CSV", "JSONL", "PARQUET");
+    // What an execution abandoned by a restart reports. AWS documents error and cause on
+    // StopExecution as free-form caller strings, so this name takes no States. prefix, which is a
+    // namespace AWS reserves for state-machine errors.
+    private static final String ABANDONED_ERROR = "ExecutionAbandoned";
+    private static final String ABANDONED_CAUSE =
+            "The emulator restarted while this execution was RUNNING; no worker survived it.";
     private static final String RESULT_WRITER_RESOURCE = "arn:aws:states:::s3:putObject";
     private static final Set<String> RESULT_WRITER_TRANSFORMATIONS = Set.of("NONE", "COMPACT", "FLATTEN");
     private static final Set<String> RESULT_WRITER_OUTPUT_TYPES = Set.of("JSON", "JSONL");
@@ -680,36 +688,81 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     /**
      * Aborts a running execution. The caller's {@code error} and {@code cause} land on the
      * Execution itself, not only on the history event, so DescribeExecution reports them.
-     *
-     * <p>The worker thread may still be inside a state when this runs. It shares this Execution
-     * instance and reads the status it publishes here, so the writes are made under the same
-     * monitor the worker's terminal write takes: ABORTED is the status that stands.
-     *
-     * <p>ExecutionAborted seals the history for the same reason: the worker still has the state it
-     * is inside left to record, and those events belong to an execution the caller has already
-     * been told is finished.
+     * {@link #markAborted} carries the terminal write and the reasons it is made under the
+     * Execution's own monitor.
      */
     public void stopExecution(String arn, String cause, String error) {
         Execution exec = describeExecution(arn);
+        if (!markAborted(exec, error, cause)) {
+            return;
+        }
+        executionStore.put(arn, exec);
+    }
+
+    /**
+     * Retires the executions a restart abandoned: they came back from storage as RUNNING with no
+     * worker behind them, and their only other writers, the worker and StopExecution, are gone.
+     * Called once at startup, before any request is served, so it takes no lock beyond the one
+     * {@link #markAborted} takes on each Execution.
+     *
+     * <p>Scans every account and writes each execution back under the account that owns it: startup
+     * has no request context, so the account-scoped accessors would silently cover only the
+     * configured default account.
+     */
+    public void abortAbandonedExecutions() {
+        int abandonedCount = 0;
+        for (AccountAwareStorageBackend.AccountEntry<Execution> entry
+                : executionStore.scanAllAccountEntries(key -> true)) {
+            if (!markAborted(entry.value(), ABANDONED_ERROR, ABANDONED_CAUSE)) {
+                continue;
+            }
+            executionStore.putForAccount(entry.accountId(), entry.key(), entry.value());
+            abandonedCount++;
+        }
+        if (abandonedCount > 0) {
+            LOG.warnv("Aborted {0} Step Functions execution(s) left RUNNING by a restart",
+                    abandonedCount);
+        }
+    }
+
+    /**
+     * Writes the terminal ABORTED status on a running execution and seals its history with
+     * ExecutionAborted, returning false when the execution is already terminal. Persisting the
+     * execution is the caller's, because StopExecution writes it under the caller's account and the
+     * startup sweep writes it under the account the entry came from.
+     *
+     * <p>The worker thread may still be inside a state when StopExecution runs. It shares this
+     * Execution instance and reads the status published here, so the writes are made under the same
+     * monitor the worker's terminal write takes: ABORTED is the status that stands.
+     *
+     * <p>ExecutionAborted seals the history for the same reason: the worker still has the state it
+     * is inside left to record, and those events belong to an execution the caller has already been
+     * told is finished.
+     */
+    private boolean markAborted(Execution exec, String error, String cause) {
         synchronized (exec) {
             if (!"RUNNING".equals(exec.getStatus())) {
-                return;
+                return false;
             }
             exec.setError(error);
             exec.setCause(cause);
             exec.setStopDate(System.currentTimeMillis() / 1000.0);
             exec.setStatus("ABORTED");
         }
-        executionStore.put(arn, exec);
 
         Map<String, Object> details = new HashMap<>();
-        if (error != null) details.put("error", error);
-        if (cause != null) details.put("cause", cause);
+        if (error != null) {
+            details.put("error", error);
+        }
+        if (cause != null) {
+            details.put("cause", cause);
+        }
         // An execution can outlive its history: the executions are stored, the histories are held in
         // memory only, so a restart in persistent mode brings a RUNNING execution back with nothing
         // behind it. The abort still gets recorded, against a history that starts here.
-        historyCache.computeIfAbsent(arn, key -> new ExecutionHistory())
+        historyCache.computeIfAbsent(exec.getExecutionArn(), key -> new ExecutionHistory())
                 .sealWith("ExecutionAborted", details);
+        return true;
     }
 
     public List<HistoryEvent> getExecutionHistory(String arn) {

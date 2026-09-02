@@ -412,6 +412,18 @@ Local, the execution starts and fails with `States.Runtime` only if the state th
 it is entered. This keeps a generated mock file usable when the collection it was built
 from is empty and the state is never reached.
 
+## Executions abandoned by a restart
+
+An execution runs in the Floci process. When Floci restarts while an execution is `RUNNING`,
+no worker survives it, so at startup every execution still stored as `RUNNING` is aborted:
+`DescribeExecution` reports `status` `ABORTED`, a `stopDate`, `error` `ExecutionAbandoned` and
+`cause` `The emulator restarted while this execution was RUNNING; no worker survived it.`, and
+`GetExecutionHistory` reports a single `ExecutionAborted` event carrying the same error and cause.
+Executions of every account are swept, each written back under its own account.
+
+Execution histories are held in memory, so the events recorded before the restart are gone and the
+execution cannot be resumed. Executions that already reached a terminal status are left untouched.
+
 ## Configuration
 
 | Variable | Default | Description |
