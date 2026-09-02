@@ -417,12 +417,16 @@ from is empty and the state is never reached.
 An execution runs in the Floci process. When Floci restarts while an execution is `RUNNING`,
 no worker survives it, so at startup every execution still stored as `RUNNING` is aborted:
 `DescribeExecution` reports `status` `ABORTED`, a `stopDate`, `error` `ExecutionAbandoned` and
-`cause` `The emulator restarted while this execution was RUNNING; no worker survived it.`, and
-`GetExecutionHistory` reports a single `ExecutionAborted` event carrying the same error and cause.
-Executions of every account are swept, each written back under its own account.
+`cause` `The emulator restarted while this execution was RUNNING; no worker survived it.`
+Executions of every account are swept, each written back under its own account. Executions that
+already reached a terminal status are left untouched, and so is the status, error and cause of one
+this sweep aborted on an earlier boot.
 
-Execution histories are held in memory, so the events recorded before the restart are gone and the
-execution cannot be resumed. Executions that already reached a terminal status are left untouched.
+Execution histories are held in memory, not in storage. The events recorded before the restart are
+gone, so the execution cannot be resumed, and `GetExecutionHistory` reports a single
+`ExecutionAborted` event carrying the same error and cause only for the boot that aborted it: after
+a further restart the execution is already terminal, no event is written, and the history is empty
+while `DescribeExecution` still reports the status, error and cause.
 
 ## Configuration
 

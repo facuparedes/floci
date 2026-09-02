@@ -693,7 +693,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
      */
     public void stopExecution(String arn, String cause, String error) {
         Execution exec = describeExecution(arn);
-        if (!markAborted(exec, error, cause)) {
+        if (!markAborted(arn, exec, error, cause)) {
             return;
         }
         executionStore.put(arn, exec);
@@ -713,7 +713,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         int abandonedCount = 0;
         for (AccountAwareStorageBackend.AccountEntry<Execution> entry
                 : executionStore.scanAllAccountEntries(key -> true)) {
-            if (!markAborted(entry.value(), ABANDONED_ERROR, ABANDONED_CAUSE)) {
+            if (!markAborted(entry.key(), entry.value(), ABANDONED_ERROR, ABANDONED_CAUSE)) {
                 continue;
             }
             executionStore.putForAccount(entry.accountId(), entry.key(), entry.value());
@@ -726,10 +726,12 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     }
 
     /**
-     * Writes the terminal ABORTED status on a running execution and seals its history with
-     * ExecutionAborted, returning false when the execution is already terminal. Persisting the
-     * execution is the caller's, because StopExecution writes it under the caller's account and the
-     * startup sweep writes it under the account the entry came from.
+     * Writes the terminal ABORTED status on a running execution and seals the history filed under
+     * {@code arn}, returning false when the execution is already terminal. The key is the caller's
+     * because it is the one GetExecutionHistory looks the history up by: StopExecution has the ARN
+     * it was called with, the startup sweep has the storage key the entry came under. Persisting
+     * the execution is the caller's too, because StopExecution writes it under the caller's account
+     * and the sweep writes it under the account that owns the entry.
      *
      * <p>The worker thread may still be inside a state when StopExecution runs. It shares this
      * Execution instance and reads the status published here, so the writes are made under the same
@@ -739,7 +741,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
      * is inside left to record, and those events belong to an execution the caller has already been
      * told is finished.
      */
-    private boolean markAborted(Execution exec, String error, String cause) {
+    private boolean markAborted(String arn, Execution exec, String error, String cause) {
         synchronized (exec) {
             if (!"RUNNING".equals(exec.getStatus())) {
                 return false;
@@ -760,7 +762,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         // An execution can outlive its history: the executions are stored, the histories are held in
         // memory only, so a restart in persistent mode brings a RUNNING execution back with nothing
         // behind it. The abort still gets recorded, against a history that starts here.
-        historyCache.computeIfAbsent(exec.getExecutionArn(), key -> new ExecutionHistory())
+        historyCache.computeIfAbsent(arn, key -> new ExecutionHistory())
                 .sealWith("ExecutionAborted", details);
         return true;
     }

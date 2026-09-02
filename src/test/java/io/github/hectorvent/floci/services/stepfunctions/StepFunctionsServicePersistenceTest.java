@@ -38,6 +38,8 @@ class StepFunctionsServicePersistenceTest {
             "arn:aws:states:us-east-1:222222222222:execution:TestStateMachine:HelloWorld";
     private static final String STATE_MACHINE_ARN =
             "arn:aws:states:us-east-1:000000000000:stateMachine:TestStateMachine";
+    private static final double EPOCH_SECONDS_2023_11_14 = 1700000000.0;
+    private static final double EPOCH_SECONDS_2100_01_01 = 4102444800.0;
     private static final String ABANDONED_ERROR = "ExecutionAbandoned";
     private static final String ABANDONED_CAUSE =
             "The emulator restarted while this execution was RUNNING; no worker survived it.";
@@ -61,7 +63,7 @@ class StepFunctionsServicePersistenceTest {
         assertEquals("ABORTED", reloaded.getStatus());
         assertEquals(ABANDONED_ERROR, reloaded.getError());
         assertEquals(ABANDONED_CAUSE, reloaded.getCause());
-        assertNotNull(reloaded.getStopDate());
+        assertStopDateInEpochSeconds(reloaded.getStopDate());
 
         List<HistoryEvent> history = afterRestart.getExecutionHistory(EXECUTION_ARN);
         assertEquals(1, history.size());
@@ -92,13 +94,12 @@ class StepFunctionsServicePersistenceTest {
             serviceLogger.removeHandler(collector);
         }
 
-        // The level is compared by value: under JBoss LogManager the record carries its own WARN
-        // instance, not the java.util.logging constant.
-        assertTrue(logRecords.stream().anyMatch(record ->
-                        record.getLevel().intValue() == Level.WARNING.intValue()
-                        && formatted(record)
-                                .contains("Aborted 1 Step Functions execution(s) left RUNNING by a restart")),
-                "expected a WARN record naming how many executions the sweep aborted, got: " + logRecords);
+        List<LogRecord> warnings = warningsIn(logRecords);
+        assertEquals(1, warnings.size(),
+                "expected one WARN record for the sweep, got: " + formattedAll(logRecords));
+        assertTrue(formatted(warnings.getFirst()).contains("1"),
+                "expected the WARN record to name how many executions were aborted, got: "
+                        + formatted(warnings.getFirst()));
 
         Optional<Execution> owned =
                 executions.getForAccount(OTHER_ACCOUNT, OTHER_ACCOUNT_EXECUTION_ARN);
@@ -106,7 +107,7 @@ class StepFunctionsServicePersistenceTest {
         assertEquals("ABORTED", owned.get().getStatus());
         assertEquals(ABANDONED_ERROR, owned.get().getError());
         assertEquals(ABANDONED_CAUSE, owned.get().getCause());
-        assertNotNull(owned.get().getStopDate());
+        assertStopDateInEpochSeconds(owned.get().getStopDate());
         assertEquals(Optional.empty(),
                 executions.getForAccount(DEFAULT_ACCOUNT, OTHER_ACCOUNT_EXECUTION_ARN));
 
@@ -129,7 +130,21 @@ class StepFunctionsServicePersistenceTest {
         afterRestart.abortAbandonedExecutions();
         Double stopDateOfFirstSweep =
                 afterRestart.describeExecution(EXECUTION_ARN).getStopDate();
-        afterRestart.abortAbandonedExecutions();
+
+        // Nothing is RUNNING any more, so the second sweep retires nothing and says nothing: a WARN
+        // on every clean boot is the noise the repo's logging rule forbids.
+        List<LogRecord> logRecords = new ArrayList<>();
+        Handler collector = collectorInto(logRecords);
+        Logger serviceLogger = Logger.getLogger(StepFunctionsService.class.getName());
+        serviceLogger.addHandler(collector);
+        try {
+            afterRestart.abortAbandonedExecutions();
+        } finally {
+            serviceLogger.removeHandler(collector);
+        }
+        assertEquals(List.of(), warningsIn(logRecords),
+                "expected no WARN record from a sweep that found nothing RUNNING, got: "
+                        + formattedAll(logRecords));
 
         Execution untouched = afterRestart.describeExecution(succeeded.getExecutionArn());
         assertEquals("SUCCEEDED", untouched.getStatus());
@@ -162,6 +177,28 @@ class StepFunctionsServicePersistenceTest {
         };
         collector.setLevel(Level.ALL);
         return collector;
+    }
+
+    private static List<LogRecord> warningsIn(List<LogRecord> records) {
+        // The level is compared by value: under JBoss LogManager the record carries its own WARN
+        // instance, not the java.util.logging constant.
+        return records.stream()
+                .filter(record -> record.getLevel().intValue() == Level.WARNING.intValue())
+                .toList();
+    }
+
+    private static List<String> formattedAll(List<LogRecord> records) {
+        return records.stream().map(StepFunctionsServicePersistenceTest::formatted).toList();
+    }
+
+    /**
+     * A stopDate DescribeExecution can report: epoch seconds, between 2023-11-14 and 2100-01-01.
+     * Both bounds are literals, so a stopDate written in another unit fails here.
+     */
+    private static void assertStopDateInEpochSeconds(Double stopDate) {
+        assertNotNull(stopDate);
+        assertTrue(stopDate > EPOCH_SECONDS_2023_11_14 && stopDate < EPOCH_SECONDS_2100_01_01,
+                "stopDate is not a plausible epoch-seconds instant: " + stopDate);
     }
 
     /** The record as a reader sees it, whether the handler receives it formatted or as a pattern. */

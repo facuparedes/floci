@@ -225,18 +225,6 @@ class EmulatorLifecycleTest {
     }
 
     @Test
-    @DisplayName("Should abort Step Functions executions abandoned by a restart on startup")
-    void shouldAbortAbandonedStepFunctionsExecutionsOnStartup() {
-        stubStorageConfig();
-        when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(false);
-        when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
-
-        emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
-
-        verify(stepFunctionsService).abortAbandonedExecutions();
-    }
-
-    @Test
     @DisplayName("Should abort abandoned Step Functions executions after loading storage")
     void shouldAbortAbandonedStepFunctionsExecutionsAfterStorageLoad() {
         stubStorageConfig();
