@@ -4187,6 +4187,85 @@ class CloudFormationIntegrationTest {
             .statusCode(404);
     }
 
+    @Test
+    void updateStack_reconcilesExistingPipe() {
+        // provision() re-runs on every UpdateStack for every resource regardless of whether its
+        // properties changed, so a fixed-name pipe used to call CreatePipe again and roll back with
+        // "Pipe cfn-update-test-pipe already exists.".
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-pipe-update-stack")
+            .formParam("TemplateBody", pipeUpdateTemplate("FirstTargetQueue"))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", "cfn-pipe-update-stack")
+            .formParam("TemplateBody", pipeUpdateTemplate("SecondTargetQueue"))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", "cfn-pipe-update-stack")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"))
+            .body(not(containsString("ROLLBACK")));
+
+        // The target change was reconciled in place under the same pipe name.
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/cfn-update-test-pipe")
+        .then()
+            .statusCode(200)
+            .body("Name", equalTo("cfn-update-test-pipe"))
+            .body("Source", containsString("cfn-pipe-update-source"))
+            .body("Target", containsString("cfn-pipe-update-target-second"));
+    }
+
+    private static String pipeUpdateTemplate(String targetLogicalId) {
+        return """
+            {
+              "Resources": {
+                "SourceQueue": {
+                  "Type": "AWS::SQS::Queue",
+                  "Properties": {"QueueName": "cfn-pipe-update-source"}
+                },
+                "FirstTargetQueue": {
+                  "Type": "AWS::SQS::Queue",
+                  "Properties": {"QueueName": "cfn-pipe-update-target-first"}
+                },
+                "SecondTargetQueue": {
+                  "Type": "AWS::SQS::Queue",
+                  "Properties": {"QueueName": "cfn-pipe-update-target-second"}
+                },
+                "MyPipe": {
+                  "Type": "AWS::Pipes::Pipe",
+                  "Properties": {
+                    "Name": "cfn-update-test-pipe",
+                    "Source": { "Fn::GetAtt": ["SourceQueue", "Arn"] },
+                    "Target": { "Fn::GetAtt": ["%s", "Arn"] },
+                    "RoleArn": "arn:aws:iam::000000000000:role/pipe-role",
+                    "DesiredState": "STOPPED"
+                  }
+                }
+              }
+            }
+            """.formatted(targetLogicalId);
+    }
+
     // ── TemplateURL (path-style AWS S3) ──────────────────────────────────────
 
     @Test
