@@ -322,7 +322,8 @@ class StepFunctionsValidateStateMachineDefinitionIntegrationTest {
                 .body("diagnostics", hasSize(1))
                 .body("diagnostics[0].severity", equalTo("ERROR"))
                 .body("diagnostics[0].code", equalTo("SCHEMA_VALIDATION_FAILED"))
-                .body("diagnostics[0].location", equalTo("/States/X/InputPath"));
+                // AWS locates this message family at the state, with no field suffix.
+                .body("diagnostics[0].location", equalTo("/States/X"));
     }
 
     @Test
@@ -363,7 +364,8 @@ class StepFunctionsValidateStateMachineDefinitionIntegrationTest {
                 .then().statusCode(200)
                 .body("result", equalTo("FAIL"))
                 .body("diagnostics", hasSize(1))
-                .body("diagnostics[0].location", equalTo("/States/M/MaxConcurrencyPath"));
+                // Measured on AWS: /States/M, the state, not the field.
+                .body("diagnostics[0].location", equalTo("/States/M"));
     }
 
     @Test
