@@ -59,13 +59,18 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
 
     // Fields that are valid only in JSONPath mode. Validated against real AWS:
     // creating a JSONata state machine with any of these fields returns SCHEMA_VALIDATION_FAILED.
-    private static final Set<String> JSONPATH_ONLY_FIELDS = Set.of(
+    // A List, not a Set.of: Set.of's iteration order is salted per JVM, so a state carrying more
+    // than one of these emits its diagnostics in a different order on each run, and a caller
+    // paging with maxResults=1 receives a different one every time. The order below is not
+    // AWS-observed, it is simply the one this code commits to.
+    private static final List<String> JSONPATH_ONLY_FIELDS = List.of(
             "InputPath", "OutputPath", "ResultPath", "ResultSelector", "Parameters", "Result", "ItemsPath",
             "MaxConcurrencyPath");
     // Fields that are valid only in JSONata mode. Validated against real AWS: a JSONPath state
-    // carrying any of them returns SCHEMA_VALIDATION_FAILED. Assign is deliberately absent — AWS
-    // accepts it on a JSONPath state, so it belongs to neither list.
-    private static final Set<String> JSONATA_ONLY_FIELDS = Set.of("Output", "Arguments", "Items");
+    // carrying any of them returns SCHEMA_VALIDATION_FAILED. Assign is deliberately absent: AWS
+    // accepts it on a JSONPath state, so it belongs to neither list. A List for the same reason as
+    // the list above, which the same expression selects between.
+    private static final List<String> JSONATA_ONLY_FIELDS = List.of("Output", "Arguments", "Items");
     // The two spellings AWS accepts in a QueryLanguage field, exactly as written here. Any other
     // value is reported against this enum, including a case AWS still resolves such as "jsonata".
     private static final Set<String> QUERY_LANGUAGES = Set.of("JSONPath", "JSONata");
@@ -1741,7 +1746,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
      */
     private static void reportFieldsOfTheOtherLanguage(String statePath, JsonNode stateDef,
                                                        boolean stateIsJsonata, List<String> errors) {
-        Collection<String> fieldsOfTheOtherLanguage =
+        List<String> fieldsOfTheOtherLanguage =
                 stateIsJsonata ? JSONPATH_ONLY_FIELDS : JSONATA_ONLY_FIELDS;
         String otherLanguage = stateIsJsonata ? "JSONPath" : "JSONata";
         for (String field : fieldsOfTheOtherLanguage) {
