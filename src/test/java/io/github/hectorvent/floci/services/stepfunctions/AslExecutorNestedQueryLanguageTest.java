@@ -84,9 +84,9 @@ class AslExecutorNestedQueryLanguageTest {
     void jsonataMapEvaluatesItsItemsWhileItsItemProcessorPassStaysOnJsonPath() {
         Execution execution = run("""
                 {
-                  "StartAt": "PROCESS_ITEMS",
+                  "StartAt": "ItemsMap",
                   "States": {
-                    "PROCESS_ITEMS": {
+                    "ItemsMap": {
                       "Type": "Map",
                       "QueryLanguage": "JSONata",
                       "Items": "{% $states.input.items %}",
@@ -120,9 +120,9 @@ class AslExecutorNestedQueryLanguageTest {
     void mapDeclaringNothingLeavesTheSameItemProcessorOutput() {
         Execution execution = run("""
                 {
-                  "StartAt": "PROCESS_ITEMS",
+                  "StartAt": "ItemsMap",
                   "States": {
-                    "PROCESS_ITEMS": {
+                    "ItemsMap": {
                       "Type": "Map",
                       "ItemsPath": "$.items",
                       "ItemProcessor": {
@@ -151,16 +151,16 @@ class AslExecutorNestedQueryLanguageTest {
     void innermostPassStaysOnJsonPathUnderTwoJsonataMaps() {
         Execution execution = run("""
                 {
-                  "StartAt": "PROCESS_ITEMS",
+                  "StartAt": "ItemsMap",
                   "States": {
-                    "PROCESS_ITEMS": {
+                    "ItemsMap": {
                       "Type": "Map",
                       "QueryLanguage": "JSONata",
                       "Items": "{% $states.input.items %}",
                       "ItemProcessor": {
-                        "StartAt": "PROCESS_SUBITEMS",
+                        "StartAt": "SubItemsMap",
                         "States": {
-                          "PROCESS_SUBITEMS": {
+                          "SubItemsMap": {
                             "Type": "Map",
                             "QueryLanguage": "JSONata",
                             "Items": "{% $states.input.subitems %}",
