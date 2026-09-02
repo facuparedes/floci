@@ -4233,6 +4233,24 @@ class CloudFormationIntegrationTest {
             .body("Name", equalTo("cfn-update-test-pipe"))
             .body("Source", containsString("cfn-pipe-update-source"))
             .body("Target", containsString("cfn-pipe-update-target-second"));
+
+        // Delete the stack and verify the pipe is gone, so the pipe does not outlive this test in
+        // the shared emulator and skew a sibling test counting pipes globally.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DeleteStack")
+            .formParam("StackName", "cfn-pipe-update-stack")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/cfn-update-test-pipe")
+        .then()
+            .statusCode(404);
     }
 
     private static String pipeUpdateTemplate(String targetLogicalId) {
