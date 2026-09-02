@@ -1755,6 +1755,13 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         String stateQL = stateDef.path("QueryLanguage").asText(null);
         boolean stateIsJsonata = stateQL != null ? "JSONata".equals(stateQL) : topLevelJsonata;
 
+        // A JSONata state machine cannot be reverted to JSONPath one state at a time. The upgrade
+        // in the other direction is allowed, which is why this reads the machine's language.
+        if (topLevelJsonata && "JSONPath".equals(stateQL)) {
+            errors.add(STATE_LOCATED_MARKER + "'QueryLanguage' can not be 'JSONPath' if set to "
+                    + "'JSONata' for whole state machine" + MARKER_PAYLOAD_SEPARATOR + statePath);
+        }
+
         validateFieldsAllowedForType(statePath, stateDef, stateType, errors);
         validateTransitionTargets(statePath, stateDef, siblingStateNames, errors);
 
@@ -1783,18 +1790,17 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
                 validateResultWriter(statePath, stateDef.get("ResultWriter"), stateIsJsonata, errors);
             }
             String processorField = stateDef.has("ItemProcessor") ? "ItemProcessor" : "Iterator";
-            String processorPath = statePath + "/" + processorField;
-            JsonNode processor = stateDef.path(processorField);
-            validateNestedStates(processor.path("States"), processorPath + "/States", processorPath + "/StartAt",
-                    processor.path("StartAt").asText(null), topLevelJsonata, errors);
+            // The sub-workflow's states default to the state machine's query language, not to this
+            // Map's: the ASL specification calls the two independent.
+            validateSubWorkflow(stateDef.path(processorField), statePath + "/" + processorField,
+                    topLevelJsonata, errors);
         } else if ("Parallel".equals(stateType)) {
             JsonNode branches = stateDef.path("Branches");
             if (branches.isArray()) {
                 for (int i = 0; i < branches.size(); i++) {
-                    JsonNode branch = branches.path(i);
-                    String branchPath = statePath + "/Branches[" + i + "]";
-                    validateNestedStates(branch.path("States"), branchPath + "/States", branchPath + "/StartAt",
-                            branch.path("StartAt").asText(null), topLevelJsonata, errors);
+                    // Same rule as ItemProcessor above: the branch inherits the machine's language.
+                    validateSubWorkflow(branches.path(i), statePath + "/Branches[" + i + "]",
+                            topLevelJsonata, errors);
                 }
             }
         }
@@ -1896,18 +1902,31 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
                 + "' at the top level is not supported. at " + path);
     }
 
-    private void validateNestedStates(JsonNode states, String statesPath, String startAtLocation,
-                                      String startAt, boolean inheritedJsonata, List<String> errors) {
+    /**
+     * Validates a Map's {@code ItemProcessor} or {@code Iterator}, or one of a Parallel's
+     * {@code Branches}. {@code inheritedJsonata} is the state machine's query language: the
+     * enclosing Map or Parallel state's own declaration governs only its own fields.
+     */
+    private void validateSubWorkflow(JsonNode subWorkflow, String subWorkflowPath,
+                                     boolean inheritedJsonata, List<String> errors) {
+        // A sub-workflow is not a state and declares no query language of its own.
+        if (subWorkflow.has("QueryLanguage")) {
+            errors.add(STATE_LOCATED_MARKER + "Field 'QueryLanguage' is not supported"
+                    + MARKER_PAYLOAD_SEPARATOR + subWorkflowPath);
+        }
+        JsonNode states = subWorkflow.path("States");
         if (!states.isObject()) {
             return;
         }
+        String statesPath = subWorkflowPath + "/States";
         Set<String> stateNames = new HashSet<>();
         states.fieldNames().forEachRemaining(stateNames::add);
         states.fields().forEachRemaining(entry -> validateState(
                 statesPath + "/" + entry.getKey(), entry.getValue(), inheritedJsonata, stateNames, errors));
         // Unlike the top level, MISSING_END_STATE does not apply here: ItemProcessor and Branches
         // are always walked for reachability regardless of whether they have a terminal state.
-        validateReachability(statesPath, states, startAt, startAtLocation, errors);
+        validateReachability(statesPath, states, subWorkflow.path("StartAt").asText(null),
+                subWorkflowPath + "/StartAt", errors);
     }
 
     private void validateMapConcurrency(String statePath, JsonNode stateDef,
