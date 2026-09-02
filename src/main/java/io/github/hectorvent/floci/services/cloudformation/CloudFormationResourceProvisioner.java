@@ -516,6 +516,13 @@ public class CloudFormationResourceProvisioner {
                         throw new IllegalStateException("No switch arm for declared legacy type "
                                 + resourceType + " — remove its LEGACY_SWITCH_TYPES entry when it "
                                 + "moves to a per-service provisioner.");
+                    } else if (!stubUnsupportedResourceTypesAllowed()) {
+                        // Before the physical id below is assigned, so the Cloud Control path sees
+                        // a resource with none and reports this message rather than a success. On
+                        // the stack path the catch below turns it into CREATE_FAILED with the same
+                        // sentence, which rolls the stack back.
+                        throw new AwsException("ValidationError",
+                                unsupportedResourceTypeMessage(resourceType), 400);
                     } else {
                         // Warn, not debug, and a status reason on the resource: the stub reports
                         // CREATE_COMPLETE while creating nothing, so without both the stack is
@@ -541,6 +548,15 @@ public class CloudFormationResourceProvisioner {
             resource.setStatusReason(e.getMessage());
         }
         return resource;
+    }
+
+    /**
+     * Whether a resource type with no provisioner may be stubbed. The provisioners hand-built in
+     * unit tests carry no config; absent configuration means the documented default, which here is
+     * the lenient behaviour, so the test reads {@code config == null ||}.
+     */
+    private boolean stubUnsupportedResourceTypesAllowed() {
+        return config == null || config.services().cloudformation().allowStubUnsupportedResourceTypes();
     }
 
     /** The one sentence Floci says about a resource type it has no provisioner for. */
