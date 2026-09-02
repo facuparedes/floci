@@ -52,7 +52,8 @@ class CloudFormationUnsupportedResourceTypeTest {
                     + "Set floci.services.cloudformation.allow-stub-unsupported-resource-types=false "
                     + "to fail the stack instead.";
     private static final String DELETE_WARNING =
-            "Skipping delete of unsupported resource type AWS::Fake::Thing: nothing was created for it.";
+            "No delete implemented for resource type AWS::Fake::Thing: "
+                    + "leaving MyThing-11a79dff in place.";
 
     private final ObjectMapper mapper = new ObjectMapper();
     private CloudFormationResourceProvisioner provisioner;
@@ -113,6 +114,9 @@ class CloudFormationUnsupportedResourceTypeTest {
 
     @Test
     void deleteOfUnsupportedTypeDoesNotThrow() {
+        // The same arm catches a type no provisioner ever created and a type the create switch does
+        // provision and this switch does not remove, so the line says what it leaves behind rather
+        // than claiming nothing was created.
         List<LogRecord> logged = new CopyOnWriteArrayList<>();
 
         assertDoesNotThrow(() -> whileCapturingProvisionerLogs(logged, () -> {
