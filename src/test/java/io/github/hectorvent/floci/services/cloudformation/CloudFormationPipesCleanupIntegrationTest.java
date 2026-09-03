@@ -137,6 +137,63 @@ class CloudFormationPipesCleanupIntegrationTest {
     }
 
     /**
+     * The cleanup phase runs after the update has committed, so a stack that never reaches the end
+     * of it keeps the displaced pipe alive with its rename cleanup still recorded. The next update
+     * finishes that cleanup before it touches the template, and the pipe the earlier rename
+     * displaced is gone by the time the stack reports UPDATE_COMPLETE.
+     */
+    @Test
+    void anInterruptedRenameCleanupDeletesTheDisplacedPipeOnTheNextUpdate() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "pipe-cleanup-resume-" + suffix;
+        String oldName = "pipe-cleanup-resume-old-" + suffix;
+        String newName = "pipe-cleanup-resume-new-" + suffix;
+
+        createStack(stackName, template(oldName, suffix));
+
+        // An Error is not a deletion failure the cleanup retries: it leaves the phase where it
+        // stands, which is what the stack looks like when the process dies mid cleanup.
+        Mockito.doThrow(new Error("cleanup interrupted"))
+                .when(pipesService)
+                .deletePipe(eq(oldName), anyString());
+
+        updateStack(stackName, template(newName, suffix));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString(
+                    "<StackStatus>UPDATE_COMPLETE_CLEANUP_IN_PROGRESS</StackStatus>"));
+        assertPipe(oldName);
+        assertPipe(newName);
+
+        Mockito.doCallRealMethod().when(pipesService).deletePipe(eq(oldName), anyString());
+        updateStack(stackName, template(newName, suffix));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"))
+            .body(not(containsString("<StackStatusReason>")));
+
+        assertPipeMissing(oldName);
+        assertPipe(newName);
+
+        deleteStack(stackName);
+        assertPipeMissing(newName);
+    }
+
+    /**
      * A rename is a replacement, and an update that fails at a later resource never commits it.
      * CloudFormation puts a replaced resource back to the configuration it had before the update,
      * so the stack resource points at the prior pipe again, the replacement the failed update
