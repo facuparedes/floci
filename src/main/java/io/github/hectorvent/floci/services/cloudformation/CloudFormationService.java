@@ -981,6 +981,15 @@ public class CloudFormationService implements ResourceProvider {
         boolean updateCommitted = false;
         Set<String> attemptedResourceIds = new LinkedHashSet<>();
         try {
+            // A cleanup marker still on a resource at this point belongs to an earlier update whose
+            // cleanup phase never reached its end: a phase that finishes clears the marker, and so
+            // does a rollback. That deletion is owed before this update touches the resource, since
+            // provisioning drops the marker and nothing would name the displaced entity again.
+            List<UpdateCleanupFailure> cleanupFailures = new ArrayList<>();
+            if (!isCreate && hasReplacementUpdates(stack)) {
+                cleanupFailures.addAll(finishCommittedResourceCleanup(stack));
+            }
+
             JsonNode template = parseTemplate(templateBody);
             stack.setOriginalTemplateBody(templateBody);
 
@@ -1199,10 +1208,10 @@ public class CloudFormationService implements ResourceProvider {
                     // resources are deleted during post-update cleanup.
                     persistStack(stack);
                 }
-                // Both cleanup paths feed the single final status/reason writer.
-                List<UpdateCleanupFailure> cleanupFailures =
-                        new ArrayList<>(deleteRemovedOrConditionFalseResources(
-                                stack, resources, conditions, region));
+                // Both cleanup paths feed the single final status/reason writer, alongside whatever
+                // the cleanup this update resumed could not delete.
+                cleanupFailures.addAll(deleteRemovedOrConditionFalseResources(
+                        stack, resources, conditions, region));
                 cleanupFailures.addAll(finishCommittedResourceCleanup(stack));
                 finishCommittedStackUpdate(stack, cleanupFailures);
                 return;
