@@ -194,6 +194,68 @@ class CloudFormationPipesCleanupIntegrationTest {
     }
 
     /**
+     * The update that resumes an interrupted cleanup owns its outcome. A resumed deletion that
+     * fails all three attempts is reported by that update, in the same UPDATE_COMPLETE status
+     * reason its own cleanup failures use, so the pipe left behind is named where the caller reads
+     * it rather than staying pending for a further update.
+     */
+    @Test
+    void anInterruptedCleanupThatFailsOnResumeNamesTheOrphanInTheStatusReason() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "pipe-cleanup-resume-failure-" + suffix;
+        String oldName = "pipe-cleanup-resume-failure-old-" + suffix;
+        String newName = "pipe-cleanup-resume-failure-new-" + suffix;
+
+        createStack(stackName, template(oldName, suffix));
+
+        Mockito.doThrow(new Error("cleanup interrupted"))
+                .when(pipesService)
+                .deletePipe(eq(oldName), anyString());
+
+        updateStack(stackName, template(newName, suffix));
+
+        // The deletion the resume picks up fails as often as it is attempted, so the resumed
+        // cleanup spends its three attempts and gives the pipe up.
+        Mockito.doThrow(new IllegalStateException("simulated resumed cleanup failure"))
+                .when(pipesService)
+                .deletePipe(eq(oldName), anyString());
+
+        updateStack(stackName, template(newName, suffix));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"))
+            .body(containsString(
+                    "The following resource(s) could not be deleted during update cleanup: "
+                            + "[MyPipe (" + oldName + ")]."));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackEvents")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<PhysicalResourceId>" + oldName + "</PhysicalResourceId>"))
+            .body(containsString("<ResourceStatus>DELETE_FAILED</ResourceStatus>"))
+            .body(containsString("simulated resumed cleanup failure"));
+
+        assertPipe(oldName);
+        assertPipe(newName);
+
+        Mockito.doCallRealMethod().when(pipesService).deletePipe(eq(oldName), anyString());
+        deleteStack(stackName);
+        pipesService.deletePipe(oldName, "us-east-1");
+    }
+
+    /**
      * A rename is a replacement, and an update that fails at a later resource never commits it.
      * CloudFormation puts a replaced resource back to the configuration it had before the update,
      * so the stack resource points at the prior pipe again, the replacement the failed update
