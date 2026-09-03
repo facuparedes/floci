@@ -2,7 +2,6 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -19,12 +18,9 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
@@ -34,9 +30,9 @@ import static org.mockito.Mockito.when;
  * {@code AWS::Pipes::Pipe} that includes the properties the pipe did not carry at all: an optional
  * property the failed update added is gone once the rollback is done.
  *
- * <p>The pipe service here is the real one over in-memory storage, so the restore is measured
- * against the semantics the service really applies. Only the tag call is stubbed, because it is
- * what fails the update after the pipe has already been written.
+ * <p>The stack update here fails at a later resource, so this pipe's own update committed and
+ * {@code rollbackUpdate} is the hook that puts it back. The pipe service is the real one over
+ * in-memory storage, so the restore is measured against the semantics the service really applies.
  */
 class PipesCfnRollbackRestoresExactConfigurationTest {
 
@@ -112,20 +108,10 @@ class PipesCfnRollbackRestoresExactConfigurationTest {
                 ENRICHMENT_ARN, envTagValue);
     }
 
-    /** Fails the stack update after the pipe itself has already been written. */
-    private void failTheTagCallOfTheUpdate() {
-        doThrow(new AwsException("InternalFailure", "tagging is unavailable", 500))
-                .when(pipes).tagResource(anyString(), anyString(), eq(Map.of("Env", "prod")));
-    }
-
-    private StackResource failedUpdateOf(String createTemplate, String updateTemplate) {
+    /** The pipe's own update commits; the stack fails further on and rolls this one back. */
+    private StackResource committedUpdateOf(String createTemplate, String updateTemplate) {
         provision(createTemplate, null);
-        failTheTagCallOfTheUpdate();
-        StackResource r = stackResource("MyPipe");
-        JsonNode template = props(updateTemplate);
-        ProvisionContext ctx = new ProvisionContext(engine, REGION, ACCOUNT_ID, "TestStack", "MyPipe");
-        assertThrows(AwsException.class, () -> provisioner.provision(r, template, ctx));
-        return r;
+        return provision(updateTemplate, "MyPipe");
     }
 
     /**
@@ -134,13 +120,13 @@ class PipesCfnRollbackRestoresExactConfigurationTest {
      */
     @Test
     void aPropertyTheFailedUpdateAddedIsGoneAfterTheRollback() {
-        StackResource r = failedUpdateOf(pipeWithoutOptionalProperties(),
+        StackResource r = committedUpdateOf(pipeWithoutOptionalProperties(),
                 pipeWithOptionalProperties("added by the failed update", "prod"));
         Pipe mutated = pipes.describePipe("MyPipe", REGION);
         assertEquals("added by the failed update", mutated.getDescription(),
-                "the failed update already wrote the description");
+                "the update wrote the description before the stack failed");
         assertEquals(ENRICHMENT_ARN, mutated.getEnrichment(),
-                "the failed update already wrote the enrichment");
+                "the update wrote the enrichment before the stack failed");
 
         assertTrue(provisioner.rollbackUpdate(r));
 
@@ -155,7 +141,7 @@ class PipesCfnRollbackRestoresExactConfigurationTest {
     /** A property the pipe did carry goes back to the value it held, not to nothing. */
     @Test
     void aPropertyTheFailedUpdateChangedGoesBackToItsFormerValue() {
-        StackResource r = failedUpdateOf(
+        StackResource r = committedUpdateOf(
                 pipeWithOptionalProperties("the original description", "dev"),
                 pipeWithOptionalProperties("the description the failed update wrote", "prod"));
 

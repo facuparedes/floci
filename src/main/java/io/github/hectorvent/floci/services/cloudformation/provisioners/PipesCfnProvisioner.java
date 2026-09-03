@@ -88,7 +88,14 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
         r.getAttributes().put("Arn", pipe.getArn());
     }
 
-    /** Reconciles the pipe already on file under this name, tags included. */
+    /**
+     * Reconciles the pipe already on file under this name, tags included.
+     *
+     * <p>updatePipe and the tag calls each write the pipe as they go, so a failure among them would
+     * otherwise leave the pipe carrying an update the stack is about to disown. This path therefore
+     * restores eagerly: the pipe goes back to the snapshot taken a line earlier before the failure
+     * leaves the provisioner, and the failure itself is what reaches the caller.
+     */
     private Pipe updateExistingPipe(StackResource r, Pipe existingPipe, String name, String source,
                                     String target, String roleArn, String description,
                                     DesiredState desiredState, String enrichment,
@@ -112,15 +119,53 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
                     "Updating Source requires resource replacement, which is not supported.", 400);
         }
         snapshotPipeBeforeUpdate(r, existingPipe, ctx.region());
-        Pipe pipe = pipesService.updatePipe(name, target, roleArn, description, desiredState,
-                enrichment, sourceParameters, targetParameters, enrichmentParameters, ctx.region());
-        reconcileTags(pipe, tags, ctx.region());
-        return pipe;
+        try {
+            Pipe pipe = pipesService.updatePipe(name, target, roleArn, description, desiredState,
+                    enrichment, sourceParameters, targetParameters, enrichmentParameters,
+                    ctx.region());
+            reconcileTags(pipe, tags, ctx.region());
+            return pipe;
+        } catch (RuntimeException updateFailure) {
+            restorePipeAfterFailedUpdate(r, updateFailure);
+            throw updateFailure;
+        }
     }
 
     /**
-     * Records what the pipe carries before updatePipe and the tag calls change it, so
-     * {@link #rollbackUpdate} can put it back when the stack update fails. Only the properties
+     * Puts the pipe back from the snapshot this update took, while the failure that interrupted the
+     * update is on its way out of the provisioner. The snapshot is spent here, so the rollback hook
+     * finds nothing left to act on for a resource already restored.
+     *
+     * <p>A restore that fails itself leaves the pipe in a configuration nobody recorded. Its reason
+     * goes on the resource under {@link CfnRollback#UPDATE_ROLLBACK_FAILURE_ATTR}, which is what
+     * makes the stack report UPDATE_ROLLBACK_FAILED naming this resource instead of a clean
+     * rollback, and it is attached to the update failure as suppressed so neither is lost. The
+     * restore repeats the calls the update just made, so it can come back carrying the very
+     * exception that interrupted the update; suppressing a throwable under itself is rejected by
+     * the JDK, and that one is already the failure being reported.
+     */
+    private void restorePipeAfterFailedUpdate(StackResource r, RuntimeException updateFailure) {
+        String rawSnapshot = r.getAttributes().get(CfnRollback.PIPE_UPDATE_SNAPSHOT_ATTR);
+        try {
+            restoreSnapshottedPipe(r, objectMapper.readTree(rawSnapshot));
+        } catch (RuntimeException | JsonProcessingException restoreFailure) {
+            if (restoreFailure != updateFailure) {
+                updateFailure.addSuppressed(restoreFailure);
+            }
+            String reason = restoreFailure.getMessage() != null
+                    ? restoreFailure.getMessage()
+                    : restoreFailure.getClass().getSimpleName();
+            LOG.errorv("Could not restore pipe {0} after a failed update: {1}",
+                    r.getPhysicalId(), reason);
+            r.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR, reason);
+        }
+    }
+
+    /**
+     * Records what the pipe carries before updatePipe and the tag calls change it, so it can be put
+     * back when the stack update fails: by {@link #restorePipeAfterFailedUpdate} when this pipe's
+     * own update is what failed, and by {@link #rollbackUpdate} when a later resource is. Only the
+     * properties
      * updatePipe accepts, plus the tags: Name, Source and Arn cannot change on this path. The
      * region travels with them because the rollback hook is handed the stack resource alone, and
      * name plus region is how PipesService addresses a pipe.
@@ -139,14 +184,19 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
         snapshot.set("enrichmentParameters", existingPipe.getEnrichmentParameters());
         snapshot.set("tags", objectMapper.valueToTree(
                 existingPipe.getTags() == null ? Map.of() : existingPipe.getTags()));
-        r.getAttributes().put(CfnRollback.PIPE_UPDATE_SNAPSHOT_ATTR, snapshot.toString());
-    }
+        r.getAttributes().put(CfnRollback.PIPE_UPDATE_SNAPSHOT_ATTR, snapshot.toString());    }
 
     /**
      * Puts the pipe back to what it carried before this update, under either shape the update takes:
      * a reconciliation in place, undone from the snapshot, or a rename, undone by pointing the
      * resource at the prior pipe again. A run performs one or the other, so the two never meet on
      * the same resource.
+     *
+     * <p>This is the hook for an update a <em>later</em> resource failed: this pipe's own update
+     * committed, so its snapshot is still unspent and holds the configuration to put back. When the
+     * pipe's own update is what failed, {@link #restorePipeAfterFailedUpdate} has already restored
+     * it inside {@code provision} and spent the snapshot there, and the service reaches this hook
+     * for that resource neither by the restored marker nor by the rollback-failure one.
      */
     @Override
     public boolean rollbackUpdate(StackResource resource) {

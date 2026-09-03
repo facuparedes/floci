@@ -563,12 +563,13 @@ class PipesCfnProvisionerTest {
     }
 
     /**
-     * updatePipe lands before the tag calls, so a tagResource that fails leaves the pipe carrying
-     * the new configuration under tags that are neither the old nor the new set. The rollback of
-     * the failed stack update puts the configuration and the tags back.
+     * updatePipe lands before the tag calls, so a tagResource that fails would leave the pipe
+     * carrying the new configuration under tags that are neither the old nor the new set. The
+     * provisioner puts the configuration and the tags back from its snapshot before the failure
+     * leaves it, and reports the failure that interrupted the update.
      */
     @Test
-    void aPipeMutatedByAFailedUpdateIsRestoredFromItsSnapshot() {
+    void aPipeMutatedByAFailedUpdateIsRestoredBeforeTheFailureLeavesTheProvisioner() {
         provision(pipeTemplateWithEveryUpdatableProperty(TARGET_QUEUE_ARN, "the first target", """
                 [{"Key": "Env", "Value": "dev"}, {"Key": "Owner", "Value": "example-team"}]
                 """), null);
@@ -582,13 +583,10 @@ class PipesCfnProvisionerTest {
                         """));
         ProvisionContext ctx = new ProvisionContext(engine, REGION, ACCOUNT_ID, "TestStack", "MyPipe");
 
-        assertThrows(AwsException.class, () -> provisioner.provision(r, template, ctx));
-        assertEquals(NEW_TARGET_QUEUE_ARN, pipesOnFile.get("MyPipe").getTarget(),
-                "the failed update already wrote the new target");
-        assertEquals(Map.of("Env", "dev"), pipesOnFile.get("MyPipe").getTags(),
-                "the failed update already dropped the Owner tag");
-
-        assertTrue(provisioner.rollbackUpdate(r));
+        AwsException reported = assertThrows(AwsException.class,
+                () -> provisioner.provision(r, template, ctx));
+        assertEquals("tagging is unavailable", reported.getMessage(),
+                "the failure that interrupted the update is what the caller gets");
 
         verify(pipes).restorePipe("MyPipe", TARGET_QUEUE_ARN, ROLE_ARN, "the first target",
                 DesiredState.STOPPED, ENRICHMENT_ARN, null, targetParametersFor("the first target"),
@@ -600,6 +598,71 @@ class PipesCfnProvisionerTest {
         assertEquals(Map.of("Env", "dev", "Owner", "example-team"), restored.getTags());
         assertNull(r.getAttributes().get(CfnRollback.PIPE_UPDATE_SNAPSHOT_ATTR),
                 "the snapshot is spent once the pipe is back");
+        assertNull(r.getAttributes().get(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR),
+                "the restore succeeded, so the stack rolls back cleanly");
+        assertFalse(provisioner.rollbackUpdate(r),
+                "the rollback hook finds nothing left to put back");
+    }
+
+    /**
+     * A restore that fails itself leaves the pipe in a configuration nobody recorded. The reason
+     * goes on the resource, which is what makes the stack report UPDATE_ROLLBACK_FAILED, and the
+     * failure that interrupted the update still reaches the caller carrying it.
+     */
+    @Test
+    void aRestoreThatFailsMarksTheResourceAndKeepsBothFailures() {
+        provision(pipeTemplateWithEveryUpdatableProperty(TARGET_QUEUE_ARN, "the first target", """
+                [{"Key": "Env", "Value": "dev"}]
+                """), null);
+        doThrow(new AwsException("InternalFailure", "tagging is unavailable", 500))
+                .when(pipes).tagResource(anyString(), anyString(), eq(Map.of("Env", "prod")));
+        doThrow(new AwsException("InternalFailure", "the pipe cannot be written", 500))
+                .when(pipes).restorePipe(anyString(), any(), any(), any(), any(), any(), any(),
+                        any(), any(), anyString());
+
+        StackResource r = stackResource("MyPipe");
+        JsonNode template = props(pipeTemplateWithEveryUpdatableProperty(
+                NEW_TARGET_QUEUE_ARN, "the second target", """
+                        [{"Key": "Env", "Value": "prod"}]
+                        """));
+        ProvisionContext ctx = new ProvisionContext(engine, REGION, ACCOUNT_ID, "TestStack", "MyPipe");
+
+        AwsException reported = assertThrows(AwsException.class,
+                () -> provisioner.provision(r, template, ctx));
+
+        assertEquals("tagging is unavailable", reported.getMessage());
+        assertEquals("the pipe cannot be written", reported.getSuppressed()[0].getMessage(),
+                "the restore failure travels with the one that interrupted the update");
+        assertEquals("the pipe cannot be written",
+                r.getAttributes().get(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR));
+    }
+
+    /**
+     * A restore failure carrying no message still has to name something the stack event can show,
+     * so the exception's own type is what the resource records.
+     */
+    @Test
+    void aRestoreFailureWithoutAMessageIsRecordedUnderItsType() {
+        provision(pipeTemplateWithEveryUpdatableProperty(TARGET_QUEUE_ARN, "the first target", """
+                [{"Key": "Env", "Value": "dev"}]
+                """), null);
+        doThrow(new AwsException("InternalFailure", "tagging is unavailable", 500))
+                .when(pipes).tagResource(anyString(), anyString(), eq(Map.of("Env", "prod")));
+        doThrow(new IllegalStateException())
+                .when(pipes).restorePipe(anyString(), any(), any(), any(), any(), any(), any(),
+                        any(), any(), anyString());
+
+        StackResource r = stackResource("MyPipe");
+        JsonNode template = props(pipeTemplateWithEveryUpdatableProperty(
+                NEW_TARGET_QUEUE_ARN, "the second target", """
+                        [{"Key": "Env", "Value": "prod"}]
+                        """));
+        ProvisionContext ctx = new ProvisionContext(engine, REGION, ACCOUNT_ID, "TestStack", "MyPipe");
+
+        assertThrows(AwsException.class, () -> provisioner.provision(r, template, ctx));
+
+        assertEquals("IllegalStateException",
+                r.getAttributes().get(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR));
     }
 
     /** A pipe this stack update never mutated has no snapshot, so there is nothing to put back. */

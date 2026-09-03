@@ -13,7 +13,6 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -227,7 +226,10 @@ class CloudFormationPipesCleanupIntegrationTest {
 
         createStack(stackName, tagReconcileTemplate(pipeName, "before", "owner", "before"));
 
+        // The update's tag call fails; the restore's own tag call is left working, which is what
+        // makes this the clean-rollback case rather than the failed-restore one below.
         Mockito.doThrow(new IllegalStateException("simulated tagResource failure"))
+                .doCallRealMethod()
                 .when(pipesService)
                 .tagResource(anyString(), anyString(), anyMap());
 
@@ -259,9 +261,10 @@ class CloudFormationPipesCleanupIntegrationTest {
     }
 
     /**
-     * The restore that follows a failed tag reconciliation can fail too, and then nobody knows what
-     * the pipe carries. The stack says so: UPDATE_ROLLBACK_FAILED naming the pipe resource, rather
-     * than a clean rollback claiming a configuration the pipe does not hold.
+     * The restore repeats the tag calls the update just made, so a tag failure that persists takes
+     * the restore down with it and nobody knows what the pipe carries. The stack says so:
+     * UPDATE_ROLLBACK_FAILED naming the pipe resource, rather than a clean rollback claiming a
+     * configuration the pipe does not hold.
      */
     @Test
     void aFailedRestoreLeavesTheStackInUpdateRollbackFailedNamingThePipe() {
@@ -271,13 +274,9 @@ class CloudFormationPipesCleanupIntegrationTest {
 
         createStack(stackName, tagReconcileTemplate(pipeName, "before", "owner", "before"));
 
-        Mockito.doThrow(new IllegalStateException("simulated tagResource failure"))
+        Mockito.doThrow(new IllegalStateException("simulated persistent tagResource failure"))
                 .when(pipesService)
                 .tagResource(anyString(), anyString(), anyMap());
-        Mockito.doThrow(new IllegalStateException("simulated restorePipe failure"))
-                .when(pipesService)
-                .restorePipe(anyString(), any(), any(), any(), any(), any(), any(), any(), any(),
-                        anyString());
 
         updateStack(stackName, tagReconcileTemplate(pipeName, "after", "team", "after"));
 
@@ -301,15 +300,15 @@ class CloudFormationPipesCleanupIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body(containsString("simulated restorePipe failure"))
+            .body(containsString("simulated persistent tagResource failure"))
             .body(not(containsString(
                     "<ResourceStatusReason>Resource update rolled back</ResourceStatusReason>")));
 
         Mockito.doCallRealMethod().when(pipesService).tagResource(anyString(), anyString(), anyMap());
-        Mockito.doCallRealMethod().when(pipesService).restorePipe(anyString(), any(), any(), any(),
-                any(), any(), any(), any(), any(), anyString());
         deleteStack(stackName);
-        assertPipeMissing(pipeName);
+        // A resource left UPDATE_FAILED by a failed rollback is not one DeleteStack removes, so the
+        // pipe outlives the stack and this test deletes it itself.
+        pipesService.deletePipe(pipeName, "us-east-1");
     }
 
     /** The pipe alone, under a fixed name, so every update reconciles it in place. */
