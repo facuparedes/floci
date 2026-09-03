@@ -758,7 +758,9 @@ class PipesCfnProvisionerTest {
         assertTrue(pipesOnFile.containsKey("MyPipe"), "the prior pipe is left alone");
         assertEquals(unrelatedPipe, pipesOnFile.get("MyRenamedPipe"),
                 "the pipe under the replacement's name is left alone");
-        assertEquals("MyRenamedPipe", renamed.getPhysicalId(),
-                "the resource still points where the failed update left it");
+        assertEquals("MyPipe", renamed.getPhysicalId(),
+                "the resource names the prior pipe the refusal keeps");
+        assertFalse(provisioner.hasReplacementUpdate(renamed),
+                "the rename cleanup is spent, so no later update deletes the prior pipe");
     }
 }

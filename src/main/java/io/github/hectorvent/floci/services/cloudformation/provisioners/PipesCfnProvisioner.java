@@ -226,6 +226,12 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
      * <p>The rename cleanup is spent here. It owes a delete only once the stack update commits, and
      * a rollback is the update never committing, so leaving it on the resource would put the pipe
      * this rollback just restored on the next cleanup's delete list.
+     *
+     * <p>The resource names the prior pipe and the cleanup is spent before the delete is attempted,
+     * because that delete can fail and its failure leaves the provisioner. A resource still naming
+     * the replacement, with the cleanup still on it, is one the next update deletes the prior pipe
+     * for, which is the pipe this rollback exists to keep. The delete failing therefore leaves the
+     * replacement orphaned and the prior pipe standing, and the stack reports the failure.
      */
     private void restoreRenamedPipe(StackResource resource, JsonNode cleanup) {
         String priorPipeName = cleanup.path("priorPipeName").asText(null);
@@ -235,10 +241,11 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
             throw new IllegalStateException("Cannot roll back resource " + resource.getLogicalId()
                     + ": the pipe " + priorPipeName + " it was renamed from is no longer on file.");
         }
-        deleteReplacementThisUpdateCreated(resource, cleanup, region);
+        String replacementPipeName = resource.getPhysicalId();
         resource.setPhysicalId(priorPipeName);
         resource.getAttributes().put("Arn", priorPipe.getArn());
         resource.getAttributes().remove(CfnRollback.PIPE_RENAME_CLEANUP_ATTR);
+        deleteReplacementThisUpdateCreated(resource, replacementPipeName, cleanup, region);
     }
 
     /**
@@ -251,10 +258,13 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
      * committed replacement displaces, which here is the prior pipe, and this path keeps that pipe
      * either way by making it the resource's physical id again. The replacement is a resource this
      * update created, which a rollback removes like any other.
+     *
+     * <p>The replacement is named by the caller: the resource already points at the prior pipe by
+     * the time this runs, so its physical id no longer holds the name to delete.
      */
-    private void deleteReplacementThisUpdateCreated(StackResource resource, JsonNode cleanup,
+    private void deleteReplacementThisUpdateCreated(StackResource resource,
+                                                    String replacementPipeName, JsonNode cleanup,
                                                     String region) {
-        String replacementPipeName = resource.getPhysicalId();
         Pipe replacement = pipeOnFile(replacementPipeName, region);
         if (replacement == null) {
             // Already deleted out of band: there is nothing left to remove and nothing to identify.
