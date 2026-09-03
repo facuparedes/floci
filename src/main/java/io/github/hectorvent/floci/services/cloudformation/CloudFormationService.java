@@ -293,6 +293,17 @@ public class CloudFormationService implements ResourceProvider {
                     throw new AwsException("AlreadyExistsException",
                             "Stack [" + stackName + "] already exists", 400);
                 }
+                // A status ending in _IN_PROGRESS says an operation owns the stack: a create, an
+                // update, a rollback or the cleanup phase of a committed update. AWS refuses to
+                // start a second one over it, and offers nothing that finishes a phase whose
+                // process is gone - DeleteStack is the only way out of one. Refusing here keeps
+                // every abandoned phase out of the next update's transaction.
+                if (!isCreateType && existing.getStatus() != null
+                        && existing.getStatus().endsWith("_IN_PROGRESS")) {
+                    throw new AwsException("ValidationError",
+                            "Stack [" + stackName + "] is in " + existing.getStatus()
+                                    + " state and cannot be updated", 400);
+                }
                 target = existing;
             }
 
@@ -981,15 +992,6 @@ public class CloudFormationService implements ResourceProvider {
         boolean updateCommitted = false;
         Set<String> attemptedResourceIds = new LinkedHashSet<>();
         try {
-            // A cleanup marker still on a resource at this point belongs to an earlier update whose
-            // cleanup phase never reached its end: a phase that finishes clears the marker, and so
-            // does a rollback. That deletion is owed before this update touches the resource, since
-            // provisioning drops the marker and nothing would name the displaced entity again.
-            List<UpdateCleanupFailure> cleanupFailures = new ArrayList<>();
-            if (!isCreate && hasReplacementUpdates(stack)) {
-                cleanupFailures.addAll(finishCommittedResourceCleanup(stack));
-            }
-
             JsonNode template = parseTemplate(templateBody);
             stack.setOriginalTemplateBody(templateBody);
 
@@ -1208,10 +1210,10 @@ public class CloudFormationService implements ResourceProvider {
                     // resources are deleted during post-update cleanup.
                     persistStack(stack);
                 }
-                // Both cleanup paths feed the single final status/reason writer, alongside whatever
-                // the cleanup this update resumed could not delete.
-                cleanupFailures.addAll(deleteRemovedOrConditionFalseResources(
-                        stack, resources, conditions, region));
+                // Both cleanup paths feed the single final status/reason writer.
+                List<UpdateCleanupFailure> cleanupFailures =
+                        new ArrayList<>(deleteRemovedOrConditionFalseResources(
+                                stack, resources, conditions, region));
                 cleanupFailures.addAll(finishCommittedResourceCleanup(stack));
                 finishCommittedStackUpdate(stack, cleanupFailures);
                 return;
@@ -1755,6 +1757,13 @@ public class CloudFormationService implements ResourceProvider {
             Collections.reverse(resources); // Delete in reverse order
 
             List<String> failedResources = new ArrayList<>();
+            // The walk below addresses each resource by its physical id, which names the entity the
+            // last update left in place. An entity displaced by a replacement whose cleanup phase
+            // never ended is named only by the cleanup the resource still carries, so the stack
+            // deletes that one too: nothing else ever will.
+            for (UpdateCleanupFailure displacedFailure : finishCommittedResourceCleanup(stack)) {
+                failedResources.add(displacedFailure.logicalId());
+            }
             for (StackResource resource : resources) {
                 // CREATE_COMPLETE/UPDATE_COMPLETE: first delete attempt. DELETE_FAILED: a previous
                 // delete left the resource behind (e.g. the bucket was non-empty); AWS re-attempts
