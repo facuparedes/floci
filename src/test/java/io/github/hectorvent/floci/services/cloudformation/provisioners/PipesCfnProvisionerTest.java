@@ -12,6 +12,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -93,6 +94,9 @@ class PipesCfnProvisionerTest {
             pipe.setEnrichmentParameters(i.getArgument(9));
             Map<String, String> tags = i.getArgument(10);
             pipe.setTags(tags != null ? new HashMap<>(tags) : new HashMap<>());
+            // The creation time is how a rollback tells the pipe this run created from one that
+            // already stood under the same name, so the stub stamps it as the service does.
+            pipe.setCreationTime(Instant.now());
             pipesOnFile.put(name, pipe);
             return pipe;
         });
@@ -631,5 +635,67 @@ class PipesCfnProvisionerTest {
 
         assertFalse(provisioner.rollbackUpdate(r));
         assertEquals(NEW_TARGET_QUEUE_ARN, pipesOnFile.get("MyPipe").getTarget());
+    }
+
+    /**
+     * A rename is a replacement, and a stack update that fails after it never commits. The rollback
+     * points the resource back at the prior pipe, which was only displaced and is put back untouched,
+     * and drops the replacement so the failed update leaves nothing behind.
+     */
+    @Test
+    void aRenameRolledBackPointsAtThePriorPipeAndDropsTheReplacement() {
+        provision(pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), null);
+        StackResource renamed = provision(
+                pipeTemplate("MyRenamedPipe", SOURCE_QUEUE_ARN, NEW_TARGET_QUEUE_ARN), "MyPipe");
+
+        assertTrue(provisioner.rollbackUpdate(renamed));
+
+        assertEquals("MyPipe", renamed.getPhysicalId(), "Ref names the prior pipe again");
+        assertEquals("arn:aws:pipes:us-east-1:000000000000:pipe/MyPipe",
+                renamed.getAttributes().get("Arn"), "Fn::GetAtt Arn names the prior pipe again");
+        verify(pipes).deletePipe("MyRenamedPipe", REGION);
+        assertFalse(pipesOnFile.containsKey("MyRenamedPipe"),
+                "the replacement the failed update created is gone");
+        assertEquals(TARGET_QUEUE_ARN, pipesOnFile.get("MyPipe").getTarget(),
+                "the prior pipe was only displaced, so it is put back untouched");
+        verify(pipes, never()).restorePipe(anyString(), any(), any(), any(), any(), any(), any(),
+                any(), any(), anyString());
+        verify(pipes, never()).updatePipe(anyString(), any(), any(), any(), any(), any(), any(),
+                any(), any(), anyString());
+        assertFalse(provisioner.hasReplacementUpdate(renamed),
+                "the rename cleanup does not fire after a rollback");
+        assertEquals(new UpdateCleanupResult(false, true, null, 0, null),
+                provisioner.completeUpdate(renamed));
+    }
+
+    /**
+     * Deleting the pipe standing under the replacement's name is only safe when this update is what
+     * created it. Any other pipe found there belongs to somebody else, so the rollback refuses and
+     * leaves both pipes where they are.
+     */
+    @Test
+    void aRenameRollbackRefusesToDeleteAPipeThisUpdateDidNotCreate() {
+        provision(pipeTemplate("MyPipe", SOURCE_QUEUE_ARN, TARGET_QUEUE_ARN), null);
+        StackResource renamed = provision(
+                pipeTemplate("MyRenamedPipe", SOURCE_QUEUE_ARN, NEW_TARGET_QUEUE_ARN), "MyPipe");
+        Pipe unrelatedPipe = new Pipe();
+        unrelatedPipe.setName("MyRenamedPipe");
+        unrelatedPipe.setArn("arn:aws:pipes:us-east-1:000000000000:pipe/MyRenamedPipe");
+        unrelatedPipe.setTarget(TARGET_QUEUE_ARN);
+        unrelatedPipe.setCreationTime(Instant.ofEpochMilli(1_000_000L));
+        pipesOnFile.put("MyRenamedPipe", unrelatedPipe);
+
+        IllegalStateException refusal = assertThrows(IllegalStateException.class,
+                () -> provisioner.rollbackUpdate(renamed));
+
+        assertEquals("Refusing to delete pipe MyRenamedPipe while rolling back resource MyPipe: "
+                + "it was not created by this stack update, so both pipes are left as they are.",
+                refusal.getMessage());
+        verify(pipes, never()).deletePipe(anyString(), anyString());
+        assertTrue(pipesOnFile.containsKey("MyPipe"), "the prior pipe is left alone");
+        assertEquals(unrelatedPipe, pipesOnFile.get("MyRenamedPipe"),
+                "the pipe under the replacement's name is left alone");
+        assertEquals("MyRenamedPipe", renamed.getPhysicalId(),
+                "the resource still points where the failed update left it");
     }
 }

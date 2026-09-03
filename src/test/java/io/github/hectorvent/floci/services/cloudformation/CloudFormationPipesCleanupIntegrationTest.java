@@ -14,6 +14,7 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
@@ -131,6 +132,105 @@ class CloudFormationPipesCleanupIntegrationTest {
         assertPipe(newName);
 
         deleteStack(stackName);
+    }
+
+    /**
+     * A rename is a replacement, and an update that fails at a later resource never commits it.
+     * CloudFormation puts a replaced resource back to the configuration it had before the update,
+     * so the stack resource points at the prior pipe again, the replacement the failed update
+     * created is gone, and the rename cleanup recorded for the committed path never fires.
+     */
+    @Test
+    void aRenameRolledBackPointsTheStackResourceAtThePriorPipe() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "pipe-rename-rollback-" + suffix;
+        String priorName = "pipe-rename-rollback-prior-" + suffix;
+        String replacementName = "pipe-rename-rollback-replacement-" + suffix;
+
+        createStack(stackName, renameRollbackTemplate(priorName, ""));
+
+        updateStack(stackName, renameRollbackTemplate(replacementName, """
+                ,
+                    "BadSecret": {
+                      "Type": "AWS::SecretsManager::Secret",
+                      "DependsOn": "MyPipe",
+                      "Properties": {
+                        "Name": "pipe-rename-rollback-secret-%s",
+                        "SecretString": "explicit",
+                        "GenerateSecretString": {"PasswordLength": 32}
+                      }
+                    }""".formatted(suffix)));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_ROLLBACK_COMPLETE</StackStatus>"))
+            .body(not(containsString("Rollback is not implemented")));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<PhysicalResourceId>" + priorName + "</PhysicalResourceId>"))
+            .body(not(containsString(replacementName)));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackEvents")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("Rollback is not implemented")))
+            .body(not(containsString("<ResourceStatus>UPDATE_FAILED</ResourceStatus>")));
+
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/" + priorName)
+        .then()
+            .statusCode(200)
+            .body("Arn", equalTo("arn:aws:pipes:us-east-1:000000000000:pipe/" + priorName))
+            .body("Target", equalTo("arn:aws:sqs:us-east-1:000000000000:pipe-rename-rollback-target"));
+        assertPipeMissing(replacementName);
+        verify(pipesService, never()).deletePipe(eq(priorName), anyString());
+
+        deleteStack(stackName);
+        assertPipeMissing(priorName);
+    }
+
+    /**
+     * The pipe alone, addressing its queues by ARN. A queue of this stack's own would report
+     * UPDATE_FAILED for want of its own rollback and hide the pipe's outcome behind
+     * UPDATE_ROLLBACK_FAILED.
+     */
+    private static String renameRollbackTemplate(String pipeName, String failingResource) {
+        return """
+                {
+                  "Resources": {
+                    "MyPipe": {
+                      "Type": "AWS::Pipes::Pipe",
+                      "Properties": {
+                        "Name": "%1$s",
+                        "Source": "arn:aws:sqs:us-east-1:000000000000:pipe-rename-rollback-source",
+                        "Target": "arn:aws:sqs:us-east-1:000000000000:pipe-rename-rollback-target",
+                        "RoleArn": "arn:aws:iam::000000000000:role/pipe-rename-rollback-role",
+                        "DesiredState": "STOPPED"
+                      }
+                    }%2$s
+                  }
+                }
+                """.formatted(pipeName, failingResource);
     }
 
     private static void createStack(String stackName, String templateBody) {
