@@ -185,8 +185,10 @@ class CloudFormationPipesCleanupIntegrationTest {
         .then()
             .statusCode(400)
             .body(containsString("<Code>ValidationError</Code>"))
-            .body(containsString("Stack [" + stackName + "] is in "
-                    + "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS state and cannot be updated"));
+            .body(containsString(
+                    "Stack:arn:aws:cloudformation:us-east-1:000000000000:stack/" + stackName + "/"))
+            .body(containsString(
+                    " is in UPDATE_COMPLETE_CLEANUP_IN_PROGRESS state and can not be updated."));
 
         // The refusal changes nothing: the stack keeps the status and both pipes it had.
         given()
@@ -242,8 +244,10 @@ class CloudFormationPipesCleanupIntegrationTest {
         .then()
             .statusCode(400)
             .body(containsString("<Code>ValidationError</Code>"))
-            .body(containsString("Stack [" + stackName + "] is in "
-                    + "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS state and cannot be updated"));
+            .body(containsString(
+                    "Stack:arn:aws:cloudformation:us-east-1:000000000000:stack/" + stackName + "/"))
+            .body(containsString(
+                    " is in UPDATE_COMPLETE_CLEANUP_IN_PROGRESS state and can not be updated."));
 
         assertPipe(oldName);
         assertPipe(newName);
