@@ -192,7 +192,8 @@ class CloudFormationPipesCleanupIntegrationTest {
         .then()
             .statusCode(200)
             .body(not(containsString("Rollback is not implemented")))
-            .body(not(containsString("<ResourceStatus>UPDATE_FAILED</ResourceStatus>")));
+            .body(containsString(
+                    "<ResourceStatusReason>Resource update rolled back</ResourceStatusReason>"));
 
         given()
             .contentType("application/json")
