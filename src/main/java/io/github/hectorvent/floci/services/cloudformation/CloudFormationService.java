@@ -298,11 +298,15 @@ public class CloudFormationService implements ResourceProvider {
                 // start a second one over it, and offers nothing that finishes a phase whose
                 // process is gone - DeleteStack is the only way out of one. Refusing here keeps
                 // every abandoned phase out of the next update's transaction.
+                //
+                // The message is the one real CloudFormation emits, down to its own "can not"
+                // spelling and the stack id carried as "Stack:<arn>" with no space: clients match
+                // on this string.
                 if (!isCreateType && existing.getStatus() != null
                         && existing.getStatus().endsWith("_IN_PROGRESS")) {
                     throw new AwsException("ValidationError",
-                            "Stack [" + stackName + "] is in " + existing.getStatus()
-                                    + " state and cannot be updated", 400);
+                            "Stack:" + existing.getStackId() + " is in " + existing.getStatus()
+                                    + " state and can not be updated.", 400);
                 }
                 target = existing;
             }
