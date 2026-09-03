@@ -332,6 +332,86 @@ class CloudFormationPipesCleanupIntegrationTest {
     }
 
     /**
+     * The rollback of a rename deletes the replacement the failed update created, and that delete
+     * can fail. The pipe the rollback exists to preserve is the prior one, so the resource names it
+     * and the rename cleanup is spent before the delete is attempted. The stack still reports
+     * UPDATE_ROLLBACK_FAILED naming the resource, the replacement is what stays orphaned, and the
+     * next update finds nothing on the resource that would delete the prior pipe.
+     */
+    @Test
+    void aRollbackThatCannotDeleteTheReplacementStillKeepsThePriorPipe() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "pipe-rename-rollback-keep-" + suffix;
+        String priorName = "pipe-rename-rollback-keep-prior-" + suffix;
+        String replacementName = "pipe-rename-rollback-keep-replacement-" + suffix;
+
+        createStack(stackName, renameRollbackTemplate(priorName, ""));
+
+        // Only the replacement's delete fails, which is the delete the rollback performs itself.
+        Mockito.doThrow(new IllegalStateException("simulated replacement delete failure"))
+                .when(pipesService)
+                .deletePipe(eq(replacementName), anyString());
+
+        updateStack(stackName, renameRollbackTemplate(replacementName, """
+                ,
+                    "BadSecret": {
+                      "Type": "AWS::SecretsManager::Secret",
+                      "DependsOn": "MyPipe",
+                      "Properties": {
+                        "Name": "pipe-rename-rollback-keep-secret-%s",
+                        "SecretString": "explicit",
+                        "GenerateSecretString": {"PasswordLength": 32}
+                      }
+                    }""".formatted(suffix)));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_ROLLBACK_FAILED</StackStatus>"))
+            .body(containsString("The following resource(s) failed to roll back: [MyPipe]."));
+
+        // The physical id is what a later cleanup and a later DeleteStack address, so it names the
+        // pipe that survived the rollback rather than the replacement left behind.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<PhysicalResourceId>" + priorName + "</PhysicalResourceId>"))
+            .body(not(containsString(replacementName)));
+
+        assertPipe(priorName);
+        assertPipe(replacementName);
+
+        Mockito.doCallRealMethod().when(pipesService).deletePipe(eq(replacementName), anyString());
+        updateStack(stackName, renameRollbackTemplate(replacementName, ""));
+
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/" + priorName)
+        .then()
+            .statusCode(200)
+            .body("Name", equalTo(priorName))
+            .body("Target", equalTo("arn:aws:sqs:us-east-1:000000000000:pipe-rename-rollback-target"));
+        verify(pipesService, never()).deletePipe(eq(priorName), anyString());
+
+        deleteStack(stackName);
+        // The rollback left the replacement orphaned and the resource UPDATE_FAILED, so neither pipe
+        // is one DeleteStack removes and this test removes them itself.
+        given().when().delete("/v1/pipes/" + priorName);
+        given().when().delete("/v1/pipes/" + replacementName);
+    }
+
+    /**
      * The tag reconciliation runs after updatePipe has already written the pipe, so a failure there
      * leaves the pipe carrying the update the stack is about to disown. The provisioner puts it back
      * from its own snapshot before the failure leaves it, description and tags alike, and the stack
