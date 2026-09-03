@@ -12,6 +12,9 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.nullValue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
@@ -208,6 +211,128 @@ class CloudFormationPipesCleanupIntegrationTest {
 
         deleteStack(stackName);
         assertPipeMissing(priorName);
+    }
+
+    /**
+     * The tag reconciliation runs after updatePipe has already written the pipe, so a failure there
+     * leaves the pipe carrying the update the stack is about to disown. The provisioner puts it back
+     * from its own snapshot before the failure leaves it, description and tags alike, and the stack
+     * reports a clean rollback.
+     */
+    @Test
+    void aFailedTagReconcileRestoresThePipeAndTheStackRollsBackCleanly() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "pipe-tag-restore-" + suffix;
+        String pipeName = "pipe-tag-restore-pipe-" + suffix;
+
+        createStack(stackName, tagReconcileTemplate(pipeName, "before", "owner", "before"));
+
+        Mockito.doThrow(new IllegalStateException("simulated tagResource failure"))
+                .when(pipesService)
+                .tagResource(anyString(), anyString(), anyMap());
+
+        updateStack(stackName, tagReconcileTemplate(pipeName, "after", "team", "after"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_ROLLBACK_COMPLETE</StackStatus>"));
+
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/" + pipeName)
+        .then()
+            .statusCode(200)
+            .body("Description", equalTo("before"))
+            .body("Tags.owner", equalTo("before"))
+            .body("Tags.team", nullValue());
+
+        Mockito.doCallRealMethod().when(pipesService).tagResource(anyString(), anyString(), anyMap());
+        deleteStack(stackName);
+        assertPipeMissing(pipeName);
+    }
+
+    /**
+     * The restore that follows a failed tag reconciliation can fail too, and then nobody knows what
+     * the pipe carries. The stack says so: UPDATE_ROLLBACK_FAILED naming the pipe resource, rather
+     * than a clean rollback claiming a configuration the pipe does not hold.
+     */
+    @Test
+    void aFailedRestoreLeavesTheStackInUpdateRollbackFailedNamingThePipe() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "pipe-restore-failure-" + suffix;
+        String pipeName = "pipe-restore-failure-pipe-" + suffix;
+
+        createStack(stackName, tagReconcileTemplate(pipeName, "before", "owner", "before"));
+
+        Mockito.doThrow(new IllegalStateException("simulated tagResource failure"))
+                .when(pipesService)
+                .tagResource(anyString(), anyString(), anyMap());
+        Mockito.doThrow(new IllegalStateException("simulated restorePipe failure"))
+                .when(pipesService)
+                .restorePipe(anyString(), any(), any(), any(), any(), any(), any(), any(), any(),
+                        anyString());
+
+        updateStack(stackName, tagReconcileTemplate(pipeName, "after", "team", "after"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_ROLLBACK_FAILED</StackStatus>"))
+            .body(containsString(
+                    "The following resource(s) failed to roll back: [MyPipe]."));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackEvents")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("simulated restorePipe failure"))
+            .body(not(containsString(
+                    "<ResourceStatusReason>Resource update rolled back</ResourceStatusReason>")));
+
+        Mockito.doCallRealMethod().when(pipesService).tagResource(anyString(), anyString(), anyMap());
+        Mockito.doCallRealMethod().when(pipesService).restorePipe(anyString(), any(), any(), any(),
+                any(), any(), any(), any(), any(), anyString());
+        deleteStack(stackName);
+        assertPipeMissing(pipeName);
+    }
+
+    /** The pipe alone, under a fixed name, so every update reconciles it in place. */
+    private static String tagReconcileTemplate(String pipeName, String description,
+                                               String tagKey, String tagValue) {
+        return """
+                {
+                  "Resources": {
+                    "MyPipe": {
+                      "Type": "AWS::Pipes::Pipe",
+                      "Properties": {
+                        "Name": "%1$s",
+                        "Source": "arn:aws:sqs:us-east-1:000000000000:pipe-tag-restore-source",
+                        "Target": "arn:aws:sqs:us-east-1:000000000000:pipe-tag-restore-target",
+                        "RoleArn": "arn:aws:iam::000000000000:role/pipe-tag-restore-role",
+                        "Description": "%2$s",
+                        "DesiredState": "STOPPED",
+                        "Tags": [{"Key": "%3$s", "Value": "%4$s"}]
+                      }
+                    }
+                  }
+                }
+                """.formatted(pipeName, description, tagKey, tagValue);
     }
 
     /**
