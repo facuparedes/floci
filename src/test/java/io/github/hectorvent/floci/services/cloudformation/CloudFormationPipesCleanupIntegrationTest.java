@@ -138,16 +138,17 @@ class CloudFormationPipesCleanupIntegrationTest {
 
     /**
      * The cleanup phase runs after the update has committed, so a stack that never reaches the end
-     * of it keeps the displaced pipe alive with its rename cleanup still recorded. The next update
-     * finishes that cleanup before it touches the template, and the pipe the earlier rename
-     * displaced is gone by the time the stack reports UPDATE_COMPLETE.
+     * of it stays in UPDATE_COMPLETE_CLEANUP_IN_PROGRESS with the displaced pipe alive. That status
+     * means an operation still owns the stack, so the next update is refused rather than made to
+     * carry a phase it did not start. DeleteStack is the way out, and it takes the displaced pipe
+     * with it.
      */
     @Test
-    void anInterruptedRenameCleanupDeletesTheDisplacedPipeOnTheNextUpdate() {
+    void anUpdateIsRefusedWhileAnInterruptedCleanupOwnsTheStack() {
         String suffix = Long.toString(System.nanoTime(), 36);
-        String stackName = "pipe-cleanup-resume-" + suffix;
-        String oldName = "pipe-cleanup-resume-old-" + suffix;
-        String newName = "pipe-cleanup-resume-new-" + suffix;
+        String stackName = "pipe-cleanup-refused-" + suffix;
+        String oldName = "pipe-cleanup-refused-old-" + suffix;
+        String newName = "pipe-cleanup-refused-new-" + suffix;
 
         createStack(stackName, template(oldName, suffix));
 
@@ -173,8 +174,21 @@ class CloudFormationPipesCleanupIntegrationTest {
         assertPipe(newName);
 
         Mockito.doCallRealMethod().when(pipesService).deletePipe(eq(oldName), anyString());
-        updateStack(stackName, template(newName, suffix));
 
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template(newName, suffix))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>ValidationError</Code>"))
+            .body(containsString("Stack [" + stackName + "] is in "
+                    + "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS state and cannot be updated"));
+
+        // The refusal changes nothing: the stack keeps the status and both pipes it had.
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
@@ -183,28 +197,28 @@ class CloudFormationPipesCleanupIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"))
-            .body(not(containsString("<StackStatusReason>")));
-
-        assertPipeMissing(oldName);
+            .body(containsString(
+                    "<StackStatus>UPDATE_COMPLETE_CLEANUP_IN_PROGRESS</StackStatus>"));
+        assertPipe(oldName);
         assertPipe(newName);
 
         deleteStack(stackName);
+        assertPipeMissing(oldName);
         assertPipeMissing(newName);
     }
 
     /**
-     * The update that resumes an interrupted cleanup owns its outcome. A resumed deletion that
-     * fails all three attempts is reported by that update, in the same UPDATE_COMPLETE status
-     * reason its own cleanup failures use, so the pipe left behind is named where the caller reads
-     * it rather than staying pending for a further update.
+     * CreateChangeSet is refused on the same terms as UpdateStack: a status ending in
+     * _IN_PROGRESS says an operation owns the stack, and no change set attaches to it. Nothing on
+     * the stack is a way to finish the phase the interruption left open, so DeleteStack is again
+     * what removes both pipes.
      */
     @Test
-    void anInterruptedCleanupThatFailsOnResumeNamesTheOrphanInTheStatusReason() {
+    void aChangeSetIsRefusedWhileAnInterruptedCleanupOwnsTheStack() {
         String suffix = Long.toString(System.nanoTime(), 36);
-        String stackName = "pipe-cleanup-resume-failure-" + suffix;
-        String oldName = "pipe-cleanup-resume-failure-old-" + suffix;
-        String newName = "pipe-cleanup-resume-failure-new-" + suffix;
+        String stackName = "pipe-cleanup-changeset-refused-" + suffix;
+        String oldName = "pipe-cleanup-changeset-refused-old-" + suffix;
+        String newName = "pipe-cleanup-changeset-refused-new-" + suffix;
 
         createStack(stackName, template(oldName, suffix));
 
@@ -214,45 +228,29 @@ class CloudFormationPipesCleanupIntegrationTest {
 
         updateStack(stackName, template(newName, suffix));
 
-        // The deletion the resume picks up fails as often as it is attempted, so the resumed
-        // cleanup spends its three attempts and gives the pipe up.
-        Mockito.doThrow(new IllegalStateException("simulated resumed cleanup failure"))
-                .when(pipesService)
-                .deletePipe(eq(oldName), anyString());
-
-        updateStack(stackName, template(newName, suffix));
+        Mockito.doCallRealMethod().when(pipesService).deletePipe(eq(oldName), anyString());
 
         given()
             .contentType("application/x-www-form-urlencoded")
-            .formParam("Action", "DescribeStacks")
+            .formParam("Action", "CreateChangeSet")
             .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "pipe-cleanup-changeset-" + suffix)
+            .formParam("ChangeSetType", "UPDATE")
+            .formParam("TemplateBody", template(newName, suffix))
         .when()
             .post("/")
         .then()
-            .statusCode(200)
-            .body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"))
-            .body(containsString(
-                    "The following resource(s) could not be deleted during update cleanup: "
-                            + "[MyPipe (" + oldName + ")]."));
-
-        given()
-            .contentType("application/x-www-form-urlencoded")
-            .formParam("Action", "DescribeStackEvents")
-            .formParam("StackName", stackName)
-        .when()
-            .post("/")
-        .then()
-            .statusCode(200)
-            .body(containsString("<PhysicalResourceId>" + oldName + "</PhysicalResourceId>"))
-            .body(containsString("<ResourceStatus>DELETE_FAILED</ResourceStatus>"))
-            .body(containsString("simulated resumed cleanup failure"));
+            .statusCode(400)
+            .body(containsString("<Code>ValidationError</Code>"))
+            .body(containsString("Stack [" + stackName + "] is in "
+                    + "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS state and cannot be updated"));
 
         assertPipe(oldName);
         assertPipe(newName);
 
-        Mockito.doCallRealMethod().when(pipesService).deletePipe(eq(oldName), anyString());
         deleteStack(stackName);
-        pipesService.deletePipe(oldName, "us-east-1");
+        assertPipeMissing(oldName);
+        assertPipeMissing(newName);
     }
 
     /**
