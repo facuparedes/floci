@@ -29,12 +29,10 @@ public final class CfnRollback {
     public static final String UPDATE_ROLLBACK_RESTORED_ATTR = "__FlociUpdateRollbackRestored";
 
     /**
-     * Carries the reason an eager restore inside a provisioner failed, so the resource is known to
-     * be in an unknown state. Set by a provisioner that mutated its entity and could not put it
-     * back; read by {@code CloudFormationService}, which copies it onto the committed resource and
-     * lands the stack on UPDATE_ROLLBACK_FAILED naming that resource instead of reporting a clean
-     * rollback. Lives here rather than on {@code CloudFormationResourceProvisioner} so extracted
-     * provisioners in this package can set it.
+     * Carries the reason a provisioner's own restoration attempt did not complete after a failed
+     * update. {@code CloudFormationService} copies it onto the committed resource so the rollback
+     * walker reports UPDATE_ROLLBACK_FAILED with that reason instead of claiming the prior entity
+     * is live. Lives here for the same reason as the marker above.
      */
     public static final String UPDATE_ROLLBACK_FAILURE_ATTR = "__FlociUpdateRollbackFailure";
 
